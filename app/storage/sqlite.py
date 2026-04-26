@@ -26,11 +26,18 @@ class SQLiteStore:
         try:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            self._migrate_schema(connection)
             connection.commit()
         except sqlite3.Error as exc:  # pragma: no cover - defensive wrapper
             raise StorageError(f"failed to initialize sqlite store: {exc}") from exc
         finally:
             connection.close()
+
+    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        columns = connection.execute("PRAGMA table_info(user_facts)").fetchall()
+        column_names = {str(column[1]) for column in columns}
+        if "embedding" not in column_names:
+            connection.execute("ALTER TABLE user_facts ADD COLUMN embedding BLOB")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

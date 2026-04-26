@@ -89,6 +89,42 @@ uvicorn app.main:app --reload
 cd frontend/cognitive-canvas
 ```
 
+## Seed Data Setup
+
+### Location
+`scripts/seed_data.py`
+
+### Usage
+```bash
+python scripts/seed_data.py
+```
+
+### What it does
+- Creates a demo user (`u_demo`)
+- Initializes a demo session (`s_demo`)
+- Adds sample user facts (L3): name, age, risk tolerance, interest
+- Adds sample session conversation turns and summary (L2)
+- Indexes a sample policy document for RAG (L4) as `policy_demo`
+
+The script is idempotent and uses existing service APIs from the app container.
+
+### How to test after seeding
+Send a chat request:
+
+```json
+{
+	"user_id": "u_demo",
+	"session_id": "s_demo",
+	"message": "What do I like?"
+}
+```
+
+Expected answer:
+
+```text
+You enjoy football.
+```
+
 #### Install dependencies (first time only)
 ```bash
 npm install

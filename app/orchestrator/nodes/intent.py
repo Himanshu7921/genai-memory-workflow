@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 class IntentClassificationNode:
     name: str = "intent_classification"
     llm_temperature: float = 0.0
-    llm_model: str = "gemini-flash-lite-latest"
+    llm_model: str = "gemini-1.5-flash"
     llm_timeout_seconds: float = 2.0
     llm_trigger_threshold: float = 0.9
     llm_fallback_models: tuple[str, ...] = ()
+    llm_parse_retries: int = 2
     cache_ttl_seconds: float = 120.0
     use_llm_for_ambiguous: bool = True
     _intent_cache: dict[str, tuple[float, tuple[str, float, list[str], str]]] = field(default_factory=dict)
@@ -190,6 +191,11 @@ class IntentClassificationNode:
         message = state.turn.message
         system_prompt = (
             "You are an intent classifier for an orchestration backend. "
+            "You MUST return ONLY valid JSON. "
+            "Do NOT include explanations, markdown, text before JSON, text after JSON, or code blocks. "
+            "Return EXACTLY one JSON object. "
+            "INVALID: Sure, here is the result: { ... }. "
+            "VALID: { ... }. "
             "Return only JSON with keys: intent, confidence, labels. "
             "Allowed intent values: calculation, grounded_qa, memory_write, general_qa. "
             "Use grounded_qa only when the user explicitly asks about supplied documents, files, policies, or citations. "
@@ -244,40 +250,64 @@ class IntentClassificationNode:
                 )
                 continue
 
-            try:
-                invoke_start = perf_counter()
-                response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-                state.metadata["intent_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
-            except Exception as exc:
-                mark_llm_failure()
-                error_category, is_quota_error = classify_llm_error(exc)
-                attempt_errors.append(
-                    {
-                        "stage": "invoke",
-                        "model": model_name,
-                        "error_type": type(exc).__name__,
-                        "error_category": error_category,
-                        "quota_exceeded": is_quota_error,
-                        "error": str(exc),
-                    }
-                )
-                logger.warning(
-                    "intent_classification_llm_invoke_failed",
-                    extra={"model": model_name, "error": str(exc), "error_type": type(exc).__name__},
-                )
-                continue
-            mark_llm_success()
+            parsed: tuple[str, float, list[str]] | None = None
+            last_raw_response = ""
+            for parse_attempt in range(self.llm_parse_retries + 1):
+                retry_suffix = ""
+                if parse_attempt > 0:
+                    retry_suffix = "\n\nYour previous response was invalid JSON. Return ONLY valid JSON."
 
-            parsed = self._parse_classifier_json(getattr(response, "content", ""))
-            if parsed is None:
+                try:
+                    invoke_start = perf_counter()
+                    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt + retry_suffix)])
+                    state.metadata["intent_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
+                except Exception as exc:
+                    mark_llm_failure()
+                    error_category, is_quota_error = classify_llm_error(exc)
+                    attempt_errors.append(
+                        {
+                            "stage": "invoke",
+                            "model": model_name,
+                            "error_type": type(exc).__name__,
+                            "error_category": error_category,
+                            "quota_exceeded": is_quota_error,
+                            "error": str(exc),
+                        }
+                    )
+                    logger.warning(
+                        "intent_classification_llm_invoke_failed",
+                        extra={"model": model_name, "error": str(exc), "error_type": type(exc).__name__},
+                    )
+                    break
+
+                raw_content = self._coerce_text(getattr(response, "content", ""))
+                last_raw_response = raw_content
+                print("RAW CLASSIFIER OUTPUT:", raw_content)
+                logger.info("RAW CLASSIFIER OUTPUT: %s", raw_content)
+
+                parsed = self._parse_classifier_json(raw_content)
+                if parsed is not None:
+                    mark_llm_success()
+                    break
+
                 attempt_errors.append(
                     {
                         "stage": "parse",
                         "model": model_name,
+                        "parse_attempt": parse_attempt,
                         "error_type": "InvalidClassifierJson",
                         "error_category": "invalid_json",
                         "quota_exceeded": False,
                         "error": "Classifier response could not be parsed as valid JSON",
+                        "raw_response": raw_content[:1000],
+                    }
+                )
+
+            if parsed is None:
+                state.metadata.setdefault("intent_invalid_json_outputs", []).append(
+                    {
+                        "model": model_name,
+                        "raw_response": last_raw_response[:1000],
                     }
                 )
                 continue
@@ -313,12 +343,15 @@ class IntentClassificationNode:
 
     def _parse_classifier_json(self, raw: object) -> tuple[str, float, list[str]] | None:
         text = raw if isinstance(raw, str) else str(raw)
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        candidate = match.group(0) if match else text
+        candidate = self._sanitize_json_text(text)
         try:
             payload = json.loads(candidate)
         except Exception:
-            return None
+            repaired = candidate.replace("'", '"')
+            try:
+                payload = json.loads(repaired)
+            except Exception:
+                return None
 
         intent = str(payload.get("intent", "")).strip().lower()
         confidence_raw = payload.get("confidence", 0.0)
@@ -333,6 +366,33 @@ class IntentClassificationNode:
         else:
             labels = []
         return intent, confidence, labels
+
+    def _sanitize_json_text(self, text: str) -> str:
+        response = text.strip().replace("```json", "").replace("```", "")
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if match:
+            return match.group(0)
+        return response.strip()
+
+    def _coerce_text(self, content: object) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                text = getattr(item, "text", None)
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+                elif isinstance(item, dict):
+                    possible = item.get("text")
+                    if isinstance(possible, str) and possible.strip():
+                        parts.append(possible.strip())
+                else:
+                    raw = str(item).strip()
+                    if raw:
+                        parts.append(raw)
+            return "\n".join(parts).strip()
+        return str(content).strip()
 
     def _heuristic_fallback(self, message: str) -> tuple[str, list[str]]:
         intent, _confidence, labels, _reason, _ambiguous = self._classify_with_rules(message)

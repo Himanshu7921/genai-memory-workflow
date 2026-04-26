@@ -66,6 +66,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         scope TEXT NOT NULL,
         canonical_key TEXT NOT NULL,
         value TEXT NOT NULL,
+        embedding BLOB,
         source TEXT NOT NULL,
         confidence REAL NOT NULL,
         priority REAL NOT NULL,

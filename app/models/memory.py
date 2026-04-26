@@ -46,6 +46,7 @@ class MemoryFact:
     supersedes_fact_id: str | None = None
     expires_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    embedding: list[float] | None = None
 
 
 @dataclass(slots=True)

@@ -497,6 +497,11 @@ class ResponseGenerationNode:
             if answer is not None:
                 return answer, "user_memory"
 
+        if self._is_preference_question(message):
+            answer = self._answer_preference_from_semantic_memory(state)
+            if answer is not None:
+                return answer, "user_memory"
+
         answer = self._answer_from_session_turns(state, message)
         if answer is not None:
             return answer, "session_memory"
@@ -510,6 +515,8 @@ class ResponseGenerationNode:
             r"\bwho\s+am\s+i\b",
             r"\bhow\s+old\s+am\s+i\b",
             r"\bwhat\s+is\s+my\s+age\b",
+            r"\bwhat\s+do\s+i\s+like\b",
+            r"\bwhat\s+are\s+my\s+preferences\b",
             r"\bwhat\s+did\s+i\s+(?:just\s+)?say\b",
             r"\bwhat\s+did\s+i\s+tell\s+you\b",
         ]
@@ -652,6 +659,31 @@ class ResponseGenerationNode:
                     return str(extracted)
 
         return None
+
+    def _is_preference_question(self, message: str) -> bool:
+        normalized = re.sub(r"\s+", " ", message.strip().lower())
+        return any(
+            phrase in normalized
+            for phrase in [
+                "what do i like",
+                "what are my preferences",
+                "what is my preference",
+            ]
+        )
+
+    def _answer_preference_from_semantic_memory(self, state: OrchestrationState) -> str | None:
+        semantic_facts = state.turn.retrieved_memory.get("semantic_user_facts", [])
+        if not semantic_facts:
+            return None
+        top = semantic_facts[0]
+        value = str(top.get("value", "")).strip()
+        if not value:
+            return None
+        if value.lower().startswith("i "):
+            rewritten = re.sub(r"^i\s+", "You ", value, flags=re.IGNORECASE)
+            rewritten = rewritten.rstrip(". ")
+            return f"{rewritten}."
+        return f"You {value}."
 
     def _extract_age(self, text: str) -> int | None:
         normalized = re.sub(r"\s+", " ", text.strip().lower())

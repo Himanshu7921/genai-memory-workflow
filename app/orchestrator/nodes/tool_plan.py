@@ -28,10 +28,11 @@ logger = logging.getLogger(__name__)
 class ToolPlanningNode:
     name: str = "tool_planning"
     llm_temperature: float = 0.0
-    llm_model: str = "gemini-flash-lite-latest"
+    llm_model: str = "gemini-1.5-flash"
     max_tool_calls: int = 3
     llm_timeout_seconds: float = 2.5
     llm_fallback_models: tuple[str, ...] = ()
+    llm_parse_retries: int = 2
 
     def run(self, state: OrchestrationState) -> NodeResult:
         if self._should_skip_llm_plan(state):
@@ -76,7 +77,14 @@ class ToolPlanningNode:
         has_retrieval_chunks = bool(state.retrieval_context and state.retrieval_context.chunks)
         system_prompt = (
             "You are a tool planner for an orchestrator backend. "
-            "Return only raw JSON with schema: {\"tool_calls\": [{\"tool_name\": str, \"arguments\": object}]}. "
+            "You MUST return ONLY valid JSON. "
+            "Do NOT include explanations, markdown, text before JSON, text after JSON, or code blocks. "
+            "Return EXACTLY one JSON object. "
+            "INVALID: Sure, here is the result: { ... }. "
+            "VALID: { ... }. "
+            "Return only raw JSON with schema: {\"tool_calls\": [{\"tool_name\": string, \"arguments\": object}]}. "
+            "You may also return a single-call schema as {\"tool\": string, \"arguments\": object}. "
+            "If you cannot decide a tool, return {\"tool\": \"none\", \"arguments\": {}}. "
             "Allowed tools: calculator, slow_tool, flaky_tool, retrieval_tool. "
             "If no tools are needed, return {\"tool_calls\": []}. "
             "Never return more than 3 tool calls."
@@ -130,40 +138,64 @@ class ToolPlanningNode:
                 )
                 continue
 
-            try:
-                invoke_start = perf_counter()
-                response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-                state.metadata["tool_plan_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
-            except Exception as exc:
-                mark_llm_failure()
-                error_category, is_quota_error = classify_llm_error(exc)
-                attempt_errors.append(
-                    {
-                        "stage": "invoke",
-                        "model": model_name,
-                        "error_type": type(exc).__name__,
-                        "error_category": error_category,
-                        "quota_exceeded": is_quota_error,
-                        "error": str(exc),
-                    }
-                )
-                logger.warning(
-                    "tool_planning_llm_invoke_failed",
-                    extra={"model": model_name, "error": str(exc), "error_type": type(exc).__name__},
-                )
-                continue
-            mark_llm_success()
+            payload: list[dict] | None = None
+            last_raw_response = ""
+            for parse_attempt in range(self.llm_parse_retries + 1):
+                retry_suffix = ""
+                if parse_attempt > 0:
+                    retry_suffix = "\n\nYour previous response was invalid JSON. Return ONLY valid JSON."
 
-            payload = self._parse_llm_tool_plan(getattr(response, "content", ""))
-            if payload is None:
+                try:
+                    invoke_start = perf_counter()
+                    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt + retry_suffix)])
+                    state.metadata["tool_plan_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
+                except Exception as exc:
+                    mark_llm_failure()
+                    error_category, is_quota_error = classify_llm_error(exc)
+                    attempt_errors.append(
+                        {
+                            "stage": "invoke",
+                            "model": model_name,
+                            "error_type": type(exc).__name__,
+                            "error_category": error_category,
+                            "quota_exceeded": is_quota_error,
+                            "error": str(exc),
+                        }
+                    )
+                    logger.warning(
+                        "tool_planning_llm_invoke_failed",
+                        extra={"model": model_name, "error": str(exc), "error_type": type(exc).__name__},
+                    )
+                    break
+
+                raw_content = self._coerce_text(getattr(response, "content", ""))
+                last_raw_response = raw_content
+                print("RAW TOOL PLAN OUTPUT:", raw_content)
+                logger.info("RAW TOOL PLAN OUTPUT: %s", raw_content)
+
+                payload = self._parse_llm_tool_plan(raw_content)
+                if payload is not None:
+                    mark_llm_success()
+                    break
+
                 attempt_errors.append(
                     {
                         "stage": "parse",
                         "model": model_name,
+                        "parse_attempt": parse_attempt,
                         "error_type": "InvalidToolPlanJson",
                         "error_category": "invalid_json",
                         "quota_exceeded": False,
                         "error": "Tool planning response could not be parsed as valid JSON",
+                        "raw_response": raw_content[:1000],
+                    }
+                )
+
+            if payload is None:
+                state.metadata.setdefault("tool_plan_invalid_json_outputs", []).append(
+                    {
+                        "model": model_name,
+                        "raw_response": last_raw_response[:1000],
                     }
                 )
                 continue
@@ -185,16 +217,28 @@ class ToolPlanningNode:
 
     def _parse_llm_tool_plan(self, raw: object) -> list[dict] | None:
         text = raw if isinstance(raw, str) else str(raw)
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
+        sanitized = self._sanitize_json_text(text)
+        if not sanitized:
             return None
-        candidate = text[start : end + 1]
+        candidate = sanitized
 
         try:
             payload = json.loads(candidate)
         except Exception:
-            return None
+            repaired = candidate.replace("'", '"')
+            try:
+                payload = json.loads(repaired)
+            except Exception:
+                return None
+
+        if isinstance(payload, dict) and "tool" in payload and "arguments" in payload:
+            tool_name = str(payload.get("tool", "")).strip().lower()
+            arguments = payload.get("arguments", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if tool_name == "none" or not tool_name:
+                return []
+            payload = {"tool_calls": [{"tool_name": tool_name, "arguments": arguments}]}
 
         calls_raw = payload.get("tool_calls")
         if not isinstance(calls_raw, list):
@@ -215,6 +259,33 @@ class ToolPlanningNode:
             if len(cleaned) >= self.max_tool_calls:
                 break
         return cleaned
+
+    def _sanitize_json_text(self, text: str) -> str:
+        response = text.strip().replace("```json", "").replace("```", "")
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if match:
+            return match.group(0)
+        return response.strip()
+
+    def _coerce_text(self, content: object) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                text = getattr(item, "text", None)
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+                elif isinstance(item, dict):
+                    possible = item.get("text")
+                    if isinstance(possible, str) and possible.strip():
+                        parts.append(possible.strip())
+                else:
+                    raw = str(item).strip()
+                    if raw:
+                        parts.append(raw)
+            return "\n".join(parts).strip()
+        return str(content).strip()
 
     def _heuristic_plan(self, state: OrchestrationState) -> list[dict]:
         message = state.turn.message.lower().strip()

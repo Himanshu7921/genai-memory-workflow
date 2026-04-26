@@ -19,6 +19,7 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
 
     protected_lines: list[str] = []
     user_facts_lines: list[str] = []
+    semantic_preference_lines: list[str] = []
     pinned_lines: list[str] = []
     if state.memory_snapshot:
         protected_facts = state.memory_snapshot.summary.protected_facts if state.memory_snapshot.summary else []
@@ -31,6 +32,16 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
         for fact in state.memory_snapshot.pinned_facts[:5]:
             if fact.value.strip():
                 pinned_lines.append(f"- {fact.canonical_key}: {fact.value.strip()[:140]} ({fact.reason})")
+    semantic_user_facts = state.turn.retrieved_memory.get("semantic_user_facts", []) if state.turn.retrieved_memory else []
+    for fact in semantic_user_facts[:5]:
+        value = str(fact.get("value", "")).strip()
+        if not value:
+            continue
+        if value.lower().startswith("i "):
+            formatted = value[0].lower() + value[1:]
+        else:
+            formatted = value
+        semantic_preference_lines.append(f"- {formatted[:140]}")
 
     document_lines: list[str] = []
     if state.retrieval_context:
@@ -75,6 +86,7 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
         f"Protected Facts (L2):\n{chr(10).join(protected_lines) if include_memory_context and protected_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n"
         f"Session Summary (L2):\n{summary if include_memory_context and summary else ('none' if include_memory_context else 'omitted due to irrelevance gate')}\n"
         f"User Facts (L3):\n{chr(10).join(user_facts_lines) if include_memory_context and user_facts_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n"
+        f"[User Preferences]\n{chr(10).join(semantic_preference_lines) if include_memory_context and semantic_preference_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n"
         f"Pinned Facts:\n{chr(10).join(pinned_lines) if include_memory_context and pinned_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n\n"
         "## Retrieved Documents\n"
         f"{chr(10).join(document_lines) if document_lines else '- none'}\n\n"

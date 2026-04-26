@@ -17,6 +17,31 @@ def _load_json(raw: str | None) -> dict[str, Any]:
     return json.loads(raw or "{}")
 
 
+def _dump_embedding(embedding: list[float] | None) -> bytes | None:
+    if not embedding:
+        return None
+    return json.dumps(embedding).encode("utf-8")
+
+
+def _load_embedding(raw: Any) -> list[float] | None:
+    if raw in (None, ""):
+        return None
+    try:
+        payload = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        values = json.loads(payload)
+    except Exception:
+        return None
+    if not isinstance(values, list):
+        return None
+    output: list[float] = []
+    for value in values:
+        try:
+            output.append(float(value))
+        except (TypeError, ValueError):
+            return None
+    return output
+
+
 def _parse_dt(raw: str | None) -> datetime | None:
     if raw in (None, ""):
         return None
@@ -364,12 +389,13 @@ class MemoryRepository:
             connection.execute(
                 """
                 INSERT INTO user_facts(
-                    fact_id, user_id, scope, canonical_key, value, source,
+                    fact_id, user_id, scope, canonical_key, value, embedding, source,
                     confidence, priority, status, supersedes_fact_id, metadata_json,
                     created_at, updated_at, last_accessed_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id) DO UPDATE SET
                     value = excluded.value,
+                    embedding = excluded.embedding,
                     source = excluded.source,
                     confidence = excluded.confidence,
                     priority = excluded.priority,
@@ -386,6 +412,7 @@ class MemoryRepository:
                     fact.scope.value,
                     fact.canonical_key,
                     fact.value,
+                    _dump_embedding(fact.embedding),
                     fact.source,
                     fact.confidence,
                     fact.priority,
@@ -426,6 +453,7 @@ class MemoryRepository:
             status=FactStatus(row["status"]),
             supersedes_fact_id=row["supersedes_fact_id"],
             metadata=_load_json(row["metadata_json"]),
+            embedding=_load_embedding(row["embedding"]) if "embedding" in row.keys() else None,
             created_at=_parse_dt(row["created_at"]) or datetime.utcnow(),
             updated_at=_parse_dt(row["updated_at"]) or datetime.utcnow(),
             last_accessed_at=_parse_dt(row["last_accessed_at"]) or datetime.utcnow(),

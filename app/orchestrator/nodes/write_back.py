@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 import logging
 import re
 
@@ -11,9 +12,20 @@ from app.memory.protected_facts import build_protected_fact, extract_protected_f
 from app.models.memory import FactScope, PinnedFact, ProtectedFact
 from app.models.orchestration import OrchestrationState
 from app.orchestrator.nodes.base import NodeResult
+from app.retrieval.embeddings import EmbeddingProvider, HashEmbeddingProvider
+from app.retrieval.embeddings_hf import HFEmbeddingProvider
 
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_fact_embedding_provider() -> EmbeddingProvider:
+    try:
+        return HFEmbeddingProvider()
+    except Exception:
+        logger.warning("fact_embedding_provider_fallback", exc_info=True)
+        return HashEmbeddingProvider()
 
 
 @dataclass(slots=True)
@@ -119,53 +131,34 @@ class MemoryWriteBackNode:
         extracted_name = self._extract_name(text)
         extracted_age = self._extract_age(text)
         if extracted_name:
-            facts.append(
-                build_fact(
-                    user_id=state.turn.user_id,
-                    scope=FactScope.USER,
-                    key="name",
-                    value=extracted_name,
-                    source="conversation",
-                    priority=1.0,
-                )
-            )
+            facts.append(self._build_fact_with_embedding(state=state, key="name", value=extracted_name, priority=1.0))
         if extracted_risk:
-            facts.append(
-                build_fact(
-                    user_id=state.turn.user_id,
-                    scope=FactScope.USER,
-                    key="risk_tolerance",
-                    value=extracted_risk,
-                    source="conversation",
-                    priority=0.95,
-                )
-            )
+            facts.append(self._build_fact_with_embedding(state=state, key="risk_tolerance", value=extracted_risk, priority=0.95))
         if extracted_age is not None:
-            facts.append(
-                build_fact(
-                    user_id=state.turn.user_id,
-                    scope=FactScope.USER,
-                    key="age",
-                    value=str(extracted_age),
-                    source="conversation",
-                    priority=0.95,
-                )
-            )
+            facts.append(self._build_fact_with_embedding(state=state, key="age", value=str(extracted_age), priority=0.95))
         if any(token in lower for token in ["my name is", "i am", "i'm"]):
             if len(facts) < self.max_facts_per_turn:
-                facts.append(
-                    build_fact(
-                        user_id=state.turn.user_id,
-                        scope=FactScope.USER,
-                        key="self_identifier",
-                        value=text,
-                        source="conversation",
-                        priority=0.7,
-                    )
-                )
+                facts.append(self._build_fact_with_embedding(state=state, key="self_identifier", value=text, priority=0.7))
         if any(token in lower for token in ["i prefer", "my preference is", "i like"]):
-            facts.append(build_fact(user_id=state.turn.user_id, scope=FactScope.USER, key="preference", value=text, source="conversation", priority=0.8))
+            facts.append(self._build_fact_with_embedding(state=state, key="preference", value=text, priority=0.8))
         return facts[: self.max_facts_per_turn]
+
+    def _build_fact_with_embedding(self, *, state: OrchestrationState, key: str, value: str, priority: float):
+        fact = build_fact(
+            user_id=state.turn.user_id,
+            scope=FactScope.USER,
+            key=key,
+            value=value,
+            source="conversation",
+            priority=priority,
+        )
+        try:
+            embedding_text = f"{fact.canonical_key}: {fact.value}"
+            fact.embedding = _get_fact_embedding_provider().embed_text(embedding_text)
+        except Exception:
+            logger.warning("fact_embedding_generation_failed", exc_info=True)
+            fact.embedding = None
+        return fact
 
     def _extract_name(self, text: str) -> str | None:
         match = re.search(
