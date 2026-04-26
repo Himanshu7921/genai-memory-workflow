@@ -76,13 +76,28 @@ Every request generates a comprehensive **Trace Audit**, allowing developers to 
 ---
 
 ## 7. Local Setup & Production Scaling
-### Deployment
+### Run backend
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
 # Launch the service
 uvicorn app.main:app --reload
+```
+### Frontend Setup
+```bash
+cd frontend/cognitive-canvas
+```
+
+#### Install dependencies (first time only)
+```bash
+npm install
+```
+
+
+#### Run development server
+```bash
+npm run dev
 ```
 
 ### Scaling Considerations
