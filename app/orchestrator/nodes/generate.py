@@ -104,6 +104,7 @@ class ResponseGenerationNode:
         sources: list[dict] = []
         used_llm = False
         memory_context_text = self._build_memory_context_text(state)
+        explicit_memory_query = self._is_explicit_memory_query(state.turn.message)
         memory_relevant, memory_similarity, matched_chunk = memory_relevance_score(
             state.turn.message,
             memory_context_text,
@@ -111,8 +112,11 @@ class ResponseGenerationNode:
         )
         if state.intent and state.intent.intent == "memory_write":
             memory_relevant = False
+        elif explicit_memory_query:
+            memory_relevant = True
 
         state.metadata["response_memory_relevant"] = memory_relevant
+        state.metadata["response_memory_explicit_query"] = explicit_memory_query
         state.metadata["response_memory_max_similarity"] = round(memory_similarity, 4)
         state.metadata["response_memory_similarity_threshold"] = self.memory_relevance_threshold
         state.metadata["response_memory_matched_chunk"] = matched_chunk or ""
@@ -176,6 +180,14 @@ class ResponseGenerationNode:
             model_tier=model_tier,
         )
         scoped_state = context_result.scoped_state
+        injected_memory = {
+            "include_memory_context": memory_relevant,
+            "memory_answer": memory_answer,
+            "summary_present": bool(scoped_state.memory_snapshot and scoped_state.memory_snapshot.summary and scoped_state.memory_snapshot.summary.summary.strip()),
+            "user_fact_count": len(scoped_state.memory_snapshot.user_facts) if scoped_state.memory_snapshot else 0,
+        }
+        state.metadata["memory_used_in_prompt"] = injected_memory
+        logger.info("Memory used in prompt: %s", injected_memory)
         state.metadata["context_budget_audit"] = context_result.audit
         state.metadata["context_eviction_events"] = list(context_result.audit.get("eviction_events", []))
         state.metadata["context_budget_model_tier"] = model_tier
@@ -490,6 +502,18 @@ class ResponseGenerationNode:
             return answer, "session_memory"
 
         return None, None
+
+    def _is_explicit_memory_query(self, message: str) -> bool:
+        normalized = re.sub(r"\s+", " ", message.strip().lower())
+        patterns = [
+            r"\bwhat\s+is\s+my\s+name\b",
+            r"\bwho\s+am\s+i\b",
+            r"\bhow\s+old\s+am\s+i\b",
+            r"\bwhat\s+is\s+my\s+age\b",
+            r"\bwhat\s+did\s+i\s+(?:just\s+)?say\b",
+            r"\bwhat\s+did\s+i\s+tell\s+you\b",
+        ]
+        return any(re.search(pattern, normalized) for pattern in patterns)
 
     def _answer_from_session_turns(self, state: OrchestrationState, message: str) -> str | None:
         if state.memory_snapshot is None:

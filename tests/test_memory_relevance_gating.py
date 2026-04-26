@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import pytest
 
 from app.llm.prompts import build_response_prompt_bundle
-from app.models.memory import MemorySnapshot, SessionSummary, WorkingMemoryTurn
+from app.models.memory import FactScope, FactStatus, MemoryFact, MemorySnapshot, SessionSummary, WorkingMemoryTurn
 from app.models.orchestration import OrchestrationState, OrchestrationTrace
+from app.orchestrator.nodes import generate as generate_module
 from app.orchestrator.nodes.generate import ResponseGenerationNode, memory_relevance_score
 from app.retrieval.embeddings import EmbeddingProvider
 
@@ -87,3 +89,33 @@ def test_noise_query_does_not_force_memory_answer_on_fallback() -> None:
     assert "response_memory_match" not in result.state.metadata
     assert result.state.response is not None
     assert result.state.response.final_answer == "ignore this"
+
+
+def test_explicit_name_query_bypasses_semantic_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _build_state("what is my name?", summary_text="")
+    now = datetime.utcnow()
+    state.memory_snapshot.user_facts = [
+        MemoryFact(
+            fact_id="fact_name",
+            user_id="u_test",
+            scope=FactScope.USER,
+            canonical_key="name",
+            value="Himanshu Singh",
+            source="conversation",
+            status=FactStatus.ACTIVE,
+            created_at=now,
+            updated_at=now,
+            last_accessed_at=now,
+        )
+    ]
+
+    monkeypatch.setattr(generate_module, "memory_relevance_score", lambda *args, **kwargs: (False, 0.0, None))
+
+    node = _NoLLMNode()
+    result = node.run(state)
+
+    assert result.state.metadata["response_memory_explicit_query"] is True
+    assert result.state.metadata["response_memory_relevant"] is True
+    assert result.state.metadata.get("response_memory_match") == "Himanshu Singh"
+    assert result.state.response is not None
+    assert result.state.response.final_answer == "Himanshu Singh"

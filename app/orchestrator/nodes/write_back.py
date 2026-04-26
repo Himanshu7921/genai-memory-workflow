@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 import re
 
 from app.memory.service import MemoryService
@@ -10,6 +11,9 @@ from app.memory.protected_facts import build_protected_fact, extract_protected_f
 from app.models.memory import FactScope, PinnedFact, ProtectedFact
 from app.models.orchestration import OrchestrationState
 from app.orchestrator.nodes.base import NodeResult
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -45,6 +49,16 @@ class MemoryWriteBackNode:
             state.metadata["facts_written"] = len(write_result.written)
             state.metadata["facts_superseded"] = len(write_result.superseded)
             state.metadata["facts_pruned"] = len(write_result.pruned)
+            stored_facts = [
+                {
+                    "canonical_key": fact.canonical_key,
+                    "value": fact.value,
+                    "status": fact.status.value,
+                }
+                for fact in write_result.written
+            ]
+            state.metadata["stored_facts"] = stored_facts
+            logger.info("Stored facts: %s", stored_facts)
 
         if state.turn.user_id and state.turn.session_id:
             session_state = self.memory_service.session.load_state(

@@ -60,7 +60,8 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
         "6. If context is insufficient, state that clearly without asking follow-up questions.\n"
         "7. Do not output raw JSON, Python dicts, internal metadata, or debugging artifacts.\n"
         "8. Keep responses short and actionable.\n"
-        "9. Use memory context only when it directly answers the current query; otherwise ignore it."
+        "9. Use memory context only when it directly answers the current query; otherwise ignore it.\n"
+        "10. For identity-related questions (name, age, who am I), prioritize User Facts (L3) when present."
     )
 
     memory_context = ""
