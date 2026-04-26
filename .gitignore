@@ -31,5 +31,10 @@ dist-ssr
 *.sln
 *.sw?
 
+# data
+data/*
+*.sqlite3
+*.db
+
 __pycache__/
 *.pyc
