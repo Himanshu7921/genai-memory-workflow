@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import re
@@ -14,6 +14,7 @@ from app.llm.client import (
     classify_llm_error,
     get_llm_client,
     get_llm_debug_key_info,
+    llm_available,
     mark_llm_failure,
     mark_llm_success,
 )
@@ -29,30 +30,67 @@ class IntentClassificationNode:
     name: str = "intent_classification"
     llm_temperature: float = 0.0
     llm_model: str = "gemini-flash-lite-latest"
-    llm_timeout_seconds: int = 20
-    llm_fallback_models: tuple[str, ...] = (
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash",
-    )
+    llm_timeout_seconds: float = 2.0
+    llm_trigger_threshold: float = 0.9
+    llm_fallback_models: tuple[str, ...] = ()
+    cache_ttl_seconds: float = 120.0
+    use_llm_for_ambiguous: bool = True
+    _intent_cache: dict[str, tuple[float, tuple[str, float, list[str], str]]] = field(default_factory=dict)
 
     def run(self, state: OrchestrationState) -> NodeResult:
         start = perf_counter()
-        result = self._classify_with_llm(state)
-        if result is None:
-            intent, labels = self._heuristic_fallback(state.turn.message)
-            state.intent = IntentResult(
-                intent=intent,
-                confidence=0.78,
-                labels=labels,
-                model_selection=ModelSelection(model_name="classifier-heuristic", fallback_used=True, reason="llm_unavailable_fallback"),
-            )
-            state.metadata["intent_classification_mode"] = "heuristic_fallback"
-            state.metadata["intent_classified_at"] = start
-            return NodeResult(state=state)
+        message = state.turn.message
+        cache_key = self._normalize(message)
+        cached = self._get_cached(cache_key)
 
-        intent, confidence, labels = result
+        if cached is not None:
+            intent, confidence, labels, reason = cached
+            state.metadata["intent_classification_mode"] = "cache"
+            state.metadata["intent_classification_reason"] = reason
+            model_selection = ModelSelection(model_name="classifier-cache", fallback_used=False, reason="cache_hit")
+        else:
+            rule_intent, rule_confidence, rule_labels, rule_reason, ambiguous = self._classify_with_rules(message)
+            state.metadata["intent_rule_ambiguous"] = ambiguous
+            state.metadata["intent_rule_reason"] = rule_reason
+
+            should_use_llm = self.use_llm_for_ambiguous and rule_confidence < self.llm_trigger_threshold
+            state.metadata["intent_rule_confidence"] = rule_confidence
+
+            if not should_use_llm:
+                intent, confidence, labels = rule_intent, rule_confidence, rule_labels
+                state.metadata["intent_classification_mode"] = "rules"
+                state.metadata["intent_classification_reason"] = rule_reason
+                state.metadata["intent_used_llm"] = False
+                logger.info(
+                    "intent_used_llm",
+                    extra={"used_llm": False, "reason": rule_reason, "confidence": rule_confidence},
+                )
+                model_selection = ModelSelection(model_name="classifier-rules", fallback_used=False, reason="deterministic_signals")
+            else:
+                llm_result = self._classify_with_llm(state)
+                if llm_result is not None:
+                    intent, confidence, labels = llm_result
+                    state.metadata["intent_classification_mode"] = "llm_disambiguation"
+                    state.metadata["intent_classification_reason"] = "low_rule_confidence"
+                    state.metadata["intent_used_llm"] = True
+                    logger.info(
+                        "intent_used_llm",
+                        extra={"used_llm": True, "reason": "low_rule_confidence", "confidence": rule_confidence},
+                    )
+                    model_selection = ModelSelection(model_name=self.llm_model, fallback_used=False, reason="llm_disambiguation")
+                else:
+                    intent, confidence, labels = rule_intent, max(0.55, rule_confidence - 0.1), rule_labels
+                    state.metadata["intent_classification_mode"] = "rules_fallback"
+                    state.metadata["intent_classification_reason"] = f"llm_unavailable:{rule_reason}"
+                    state.metadata["intent_used_llm"] = False
+                    logger.info(
+                        "intent_used_llm",
+                        extra={"used_llm": False, "reason": "llm_unavailable", "confidence": rule_confidence},
+                    )
+                    model_selection = ModelSelection(model_name="classifier-rules", fallback_used=True, reason="llm_unavailable")
+
+            self._set_cached(cache_key, (intent, confidence, labels, state.metadata["intent_classification_reason"]))
+
         if intent == "grounded_qa" and not state.turn.document_ids and not self._is_explicit_document_query(state.turn.message):
             intent = "general_qa"
             labels = [label for label in labels if label != "retrieval_needed"]
@@ -64,13 +102,91 @@ class IntentClassificationNode:
             intent=intent,
             confidence=confidence,
             labels=labels,
-            model_selection=ModelSelection(model_name=self.llm_model, fallback_used=False, reason="llm_classifier"),
+            model_selection=model_selection,
         )
-        state.metadata["intent_classification_mode"] = "llm"
         state.metadata["intent_classified_at"] = start
+        state.metadata["intent_classification_duration_ms"] = int((perf_counter() - start) * 1000)
         return NodeResult(state=state)
 
+    def _get_cached(self, key: str) -> tuple[str, float, list[str], str] | None:
+        cached = self._intent_cache.get(key)
+        if cached is None:
+            return None
+        written_at, value = cached
+        if perf_counter() - written_at > self.cache_ttl_seconds:
+            self._intent_cache.pop(key, None)
+            return None
+        return value
+
+    def _set_cached(self, key: str, value: tuple[str, float, list[str], str]) -> None:
+        self._intent_cache[key] = (perf_counter(), value)
+
+    def _normalize(self, message: str) -> str:
+        return re.sub(r"\s+", " ", message.strip().lower())
+
+    def _classify_with_rules(self, message: str) -> tuple[str, float, list[str], str, bool]:
+        text = self._normalize(message)
+        is_question = "?" in text or text.startswith(("what", "who", "how", "when", "where", "why", "can", "could", "do", "does", "is "))
+
+        scores = {
+            "calculation": 0.0,
+            "grounded_qa": 0.0,
+            "memory_write": 0.0,
+            "general_qa": 0.35,
+        }
+        reasons: dict[str, list[str]] = {k: [] for k in scores}
+
+        if re.search(r"\b\d+\s*[\+\-\*/%]\s*\d+\b", text) or any(
+            token in text for token in ["calculate", "sum", "add", "subtract", "multiply", "divide", "equation"]
+        ):
+            scores["calculation"] += 3.0
+            reasons["calculation"].append("math_pattern")
+
+        if any(
+            token in text
+            for token in ["document", "docs", "file", "policy", "manual", "warranty", "citation", "source", "according to"]
+        ):
+            scores["grounded_qa"] += 3.0
+            reasons["grounded_qa"].append("document_reference")
+
+        if any(token in text for token in ["remember that", "save this", "note that", "store this"]):
+            scores["memory_write"] += 3.2
+            reasons["memory_write"].append("explicit_memory_write")
+
+        if not is_question and re.search(
+            r"\b(my name is|i am\s+\d+|i work at|i prefer|my favorite|my favourite|my risk tolerance is)\b",
+            text,
+        ):
+            scores["memory_write"] += 2.4
+            reasons["memory_write"].append("first_person_fact_statement")
+
+        if any(token in text for token in ["what is my", "who am i", "how old am i"]):
+            scores["general_qa"] += 1.2
+            reasons["general_qa"].append("memory_query_not_write")
+
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        top_intent, top_score = ordered[0]
+        second_score = ordered[1][1]
+        ambiguous = (top_score - second_score) < 0.8
+
+        if top_intent == "calculation":
+            labels = ["tool_needed", "math"]
+        elif top_intent == "grounded_qa":
+            labels = ["retrieval_needed"]
+        elif top_intent == "memory_write":
+            labels = ["memory_write"]
+        else:
+            labels = ["answer_only"]
+
+        confidence = min(0.89, 0.55 + (top_score * 0.1) - (0.12 if ambiguous else 0.0))
+        confidence = max(0.5, confidence)
+        reason = ",".join(reasons[top_intent]) if reasons[top_intent] else "default_general"
+        return top_intent, confidence, labels, reason, ambiguous
+
     def _classify_with_llm(self, state: OrchestrationState) -> tuple[str, float, list[str]] | None:
+        if not llm_available():
+            return None
+
         message = state.turn.message
         system_prompt = (
             "You are an intent classifier for an orchestration backend. "
@@ -91,9 +207,10 @@ class IntentClassificationNode:
             "primary_model": self.llm_model,
             "candidate_models": build_model_candidates(self.llm_model, self.llm_fallback_models),
             "temperature": self.llm_temperature,
-            "timeout_seconds": max(self.llm_timeout_seconds, 10),
+            "timeout_seconds": self.llm_timeout_seconds,
             "system_chars": len(system_prompt),
             "user_chars": len(user_prompt),
+            "prompt_tokens_estimate": int((len(system_prompt) + len(user_prompt)) / 4),
             **get_llm_debug_key_info(),
         }
 
@@ -128,7 +245,9 @@ class IntentClassificationNode:
                 continue
 
             try:
+                invoke_start = perf_counter()
                 response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+                state.metadata["intent_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
             except Exception as exc:
                 mark_llm_failure()
                 error_category, is_quota_error = classify_llm_error(exc)
@@ -216,19 +335,7 @@ class IntentClassificationNode:
         return intent, confidence, labels
 
     def _heuristic_fallback(self, message: str) -> tuple[str, list[str]]:
-        text = message.lower().strip()
-        if any(token in text for token in ["calculate", "sum", "add", "+", "minus", "multiply"]):
-            intent = "calculation"
-            labels = ["tool_needed", "math"]
-        elif any(token in text for token in ["document", "file", "policy", "warranty", "search", "find"]):
-            intent = "grounded_qa"
-            labels = ["retrieval_needed"]
-        elif any(token in text for token in ["remember", "save", "my name", "i prefer", "i work", "i am"]):
-            intent = "memory_write"
-            labels = ["memory_write"]
-        else:
-            intent = "general_qa"
-            labels = ["answer_only"]
+        intent, _confidence, labels, _reason, _ambiguous = self._classify_with_rules(message)
         return intent, labels
 
     def _is_explicit_document_query(self, message: str) -> bool:

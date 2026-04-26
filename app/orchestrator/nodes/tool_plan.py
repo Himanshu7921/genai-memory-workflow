@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+from time import perf_counter
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -29,26 +30,47 @@ class ToolPlanningNode:
     llm_temperature: float = 0.0
     llm_model: str = "gemini-flash-lite-latest"
     max_tool_calls: int = 3
-    llm_timeout_seconds: int = 20
-    llm_fallback_models: tuple[str, ...] = (
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash",
-    )
+    llm_timeout_seconds: float = 2.5
+    llm_fallback_models: tuple[str, ...] = ()
 
     def run(self, state: OrchestrationState) -> NodeResult:
-        tool_calls = self._plan_with_llm(state)
-        if tool_calls is None:
+        if self._should_skip_llm_plan(state):
             tool_calls = self._heuristic_plan(state)
-            reason = "heuristic_plan_fallback"
-            state.metadata["tool_plan_mode"] = "heuristic_fallback"
+            reason = "heuristic_fast_path"
+            state.metadata["tool_plan_mode"] = "heuristic_fast_path"
         else:
-            reason = "llm_plan"
-            state.metadata["tool_plan_mode"] = "llm"
+            tool_calls = self._plan_with_llm(state)
+            if tool_calls is None:
+                tool_calls = self._heuristic_plan(state)
+                reason = "heuristic_plan_fallback"
+                state.metadata["tool_plan_mode"] = "heuristic_fallback"
+            else:
+                reason = "llm_plan"
+                state.metadata["tool_plan_mode"] = "llm"
 
         state.tool_plan = ToolPlanResult(tool_calls=tool_calls[: self.max_tool_calls], reason=reason)
         return NodeResult(state=state)
+
+    def _should_skip_llm_plan(self, state: OrchestrationState) -> bool:
+        message = state.turn.message.lower().strip()
+        intent = state.intent.intent if state.intent else ""
+
+        if intent == "calculation":
+            return True
+
+        # Skip only for trivial personal lookups where tool planning adds no value.
+        simple_lookup_patterns = [
+            r"\bwhat\s+is\s+my\s+name\b",
+            r"\bwho\s+am\s+i\b",
+            r"\bwhat(?:'s|\s+is)\s+my\s+age\b",
+            r"\bhow\s+old\s+am\s+i\b",
+        ]
+        if intent in {"general_qa", "memory_write"} and any(
+            re.search(pattern, message) for pattern in simple_lookup_patterns
+        ):
+            return True
+
+        return False
 
     def _plan_with_llm(self, state: OrchestrationState) -> list[dict] | None:
         has_retrieval_chunks = bool(state.retrieval_context and state.retrieval_context.chunks)
@@ -60,9 +82,9 @@ class ToolPlanningNode:
             "Never return more than 3 tool calls."
         )
         user_prompt = (
-            f"message: {state.turn.message}\n"
+            f"message: {state.turn.message[:220]}\n"
             f"intent: {state.intent.intent if state.intent else 'unknown'}\n"
-            f"document_ids: {state.turn.document_ids}\n"
+            f"document_count: {len(state.turn.document_ids)}\n"
             f"has_retrieval_chunks: {has_retrieval_chunks}\n"
             "Plan tool calls now as JSON only."
         )
@@ -71,9 +93,10 @@ class ToolPlanningNode:
             "primary_model": self.llm_model,
             "candidate_models": build_model_candidates(self.llm_model, self.llm_fallback_models),
             "temperature": self.llm_temperature,
-            "timeout_seconds": max(self.llm_timeout_seconds, 10),
+            "timeout_seconds": self.llm_timeout_seconds,
             "system_chars": len(system_prompt),
             "user_chars": len(user_prompt),
+            "prompt_tokens_estimate": int((len(system_prompt) + len(user_prompt)) / 4),
             **get_llm_debug_key_info(),
         }
 
@@ -108,7 +131,9 @@ class ToolPlanningNode:
                 continue
 
             try:
+                invoke_start = perf_counter()
                 response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+                state.metadata["tool_plan_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
             except Exception as exc:
                 mark_llm_failure()
                 error_category, is_quota_error = classify_llm_error(exc)
@@ -208,8 +233,6 @@ class ToolPlanningNode:
         if (
             state.intent
             and state.intent.intent == "grounded_qa"
-            and state.retrieval_context
-            and state.retrieval_context.chunks
             and not self._is_personal_memory_question(message)
         ):
             tool_calls.append(
@@ -218,7 +241,7 @@ class ToolPlanningNode:
                     "arguments": {
                         "query": state.turn.message,
                         "document_ids": state.turn.document_ids,
-                        "top_k": 5,
+                        "top_k": 3,
                     },
                 }
             )

@@ -9,23 +9,30 @@ export interface ChatMessage {
 }
 
 export interface RetrievedChunk {
+  type?: string;
   id?: string;
+  chunk_id?: string;
   document_id?: string;
   title?: string;
   content?: string;
   text?: string;
   score?: number;
   source?: string;
+  metadata?: Record<string, unknown>;
   [k: string]: unknown;
 }
 
 export interface ToolCall {
+  type?: string;
   name: string;
   input?: unknown;
   output?: unknown;
   result?: unknown;
   latency_ms?: number;
   status?: string;
+  document_id?: string;
+  chunk_id?: string;
+  metadata?: Record<string, unknown>;
   [k: string]: unknown;
 }
 
@@ -59,6 +66,15 @@ export interface TraceStep {
   [k: string]: unknown;
 }
 
+export interface WorkflowObservabilityState {
+  traceEvents: TraceStep[];
+  ragSources: RetrievedChunk[];
+  toolEvents: ToolCall[];
+  budgetAudit?: BudgetAudit;
+  sessionSummary?: string;
+  userFacts: Array<{ key?: string; value: string; confidence?: number; pinned?: boolean }>;
+}
+
 export interface ChatResponseMeta {
   final_answer?: string;
   sources?: RetrievedChunk[];
@@ -82,6 +98,7 @@ export interface ChatResponseMeta {
     l3?: MemoryL3;
     l4?: RetrievedChunk[];
   };
+  metadata?: Record<string, unknown>;
   raw?: unknown;
   [k: string]: unknown;
 }

@@ -1,16 +1,22 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { ChatMessage, ChatSession, ChatResponseMeta } from "@/lib/types";
+import type {
+  ChatMessage,
+  ChatSession,
+  ChatResponseMeta,
+  WorkflowObservabilityState,
+} from "@/lib/types";
 
-const DEFAULT_BACKEND_BASE_URL = "http://127.0.0.1:8000";
+export const DEFAULT_BACKEND_BASE_URL =
+  (import.meta.env.VITE_BACKEND_BASE_URL?.trim().replace(/\/$/, "") ?? "") ||
+  "http://127.0.0.1:8000";
 const DEFAULT_USER_ID = "user_local";
 
 const uid = () =>
-  (globalThis.crypto?.randomUUID?.() ??
-    Math.random().toString(36).slice(2) + Date.now().toString(36));
+  globalThis.crypto?.randomUUID?.() ??
+  Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-const makeUserId = () =>
-  "user_" + Math.random().toString(36).slice(2, 8);
+const makeUserId = () => "user_" + Math.random().toString(36).slice(2, 8);
 
 interface Settings {
   baseUrl: string;
@@ -22,6 +28,7 @@ interface AppState {
   settings: Settings;
   sessions: ChatSession[];
   activeSessionId: string | null;
+  observability: WorkflowObservabilityState;
   setSettings: (s: Partial<Settings>) => void;
   createSession: (title?: string) => string;
   deleteSession: (id: string) => void;
@@ -30,9 +37,20 @@ interface AppState {
   appendMessage: (sessionId: string, msg: ChatMessage) => void;
   updateMessage: (sessionId: string, id: string, patch: Partial<ChatMessage>) => void;
   setSessionDocs: (sessionId: string, ids: string[]) => void;
+  clearObservability: () => void;
+  setObservabilityFromMeta: (meta: ChatResponseMeta) => void;
   getActiveSession: () => ChatSession | undefined;
   getLatestMeta: () => ChatResponseMeta | undefined;
 }
+
+const EMPTY_OBSERVABILITY: WorkflowObservabilityState = {
+  traceEvents: [],
+  ragSources: [],
+  toolEvents: [],
+  budgetAudit: undefined,
+  sessionSummary: undefined,
+  userFacts: [],
+};
 
 export const useAppStore = create<AppState>()(
   persist(
@@ -44,9 +62,9 @@ export const useAppStore = create<AppState>()(
       },
       sessions: [],
       activeSessionId: null,
+      observability: EMPTY_OBSERVABILITY,
 
-      setSettings: (s) =>
-        set((st) => ({ settings: { ...st.settings, ...s } })),
+      setSettings: (s) => set((st) => ({ settings: { ...st.settings, ...s } })),
 
       createSession: (title) => {
         const id = uid();
@@ -69,9 +87,7 @@ export const useAppStore = create<AppState>()(
         set((st) => {
           const sessions = st.sessions.filter((s) => s.id !== id);
           const activeSessionId =
-            st.activeSessionId === id
-              ? (sessions[0]?.id ?? null)
-              : st.activeSessionId;
+            st.activeSessionId === id ? (sessions[0]?.id ?? null) : st.activeSessionId;
           return { sessions, activeSessionId };
         }),
 
@@ -107,9 +123,7 @@ export const useAppStore = create<AppState>()(
             s.id === sessionId
               ? {
                   ...s,
-                  messages: s.messages.map((m) =>
-                    m.id === id ? { ...m, ...patch } : m,
-                  ),
+                  messages: s.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
                   updatedAt: Date.now(),
                 }
               : s,
@@ -118,10 +132,69 @@ export const useAppStore = create<AppState>()(
 
       setSessionDocs: (sessionId, ids) =>
         set((st) => ({
-          sessions: st.sessions.map((s) =>
-            s.id === sessionId ? { ...s, documentIds: ids } : s,
-          ),
+          sessions: st.sessions.map((s) => (s.id === sessionId ? { ...s, documentIds: ids } : s)),
         })),
+
+      clearObservability: () => set({ observability: EMPTY_OBSERVABILITY }),
+
+      setObservabilityFromMeta: (meta) => {
+        const traceEvents = meta.trace ?? [];
+        const ragSources = meta.retrieved_chunks ?? meta.sources ?? [];
+        const toolEvents = meta.tool_calls ?? meta.tools ?? [];
+        const sessionSummary =
+          (meta.metadata && typeof meta.metadata.write_back_summary === "string"
+            ? meta.metadata.write_back_summary
+            : undefined) ??
+          (typeof meta.write_back_summary === "string" ? meta.write_back_summary : undefined) ??
+          meta.memory?.l2?.summary;
+
+        const rawFacts =
+          (meta.metadata && meta.metadata.write_back_facts) ??
+          (meta.write_back_facts as unknown) ??
+          meta.memory?.l3?.facts ??
+          [];
+
+        const userFacts = Array.isArray(rawFacts)
+          ? rawFacts
+              .map((fact) => {
+                if (typeof fact === "string") {
+                  return { value: fact.trim() };
+                }
+                if (!fact || typeof fact !== "object") {
+                  return null;
+                }
+                const item = fact as Record<string, unknown>;
+                const value =
+                  (typeof item.value === "string" && item.value.trim()) ||
+                  (typeof item.fact === "string" && item.fact.trim()) ||
+                  (typeof item.text === "string" && item.text.trim()) ||
+                  (typeof item.summary === "string" && item.summary.trim()) ||
+                  "";
+                if (!value) return null;
+                return {
+                  key: typeof item.key === "string" ? item.key : undefined,
+                  value,
+                  confidence: typeof item.confidence === "number" ? item.confidence : undefined,
+                  pinned: typeof item.pinned === "boolean" ? item.pinned : undefined,
+                };
+              })
+              .filter(
+                (fact): fact is { key?: string; value: string; confidence?: number; pinned?: boolean } =>
+                  Boolean(fact),
+              )
+          : [];
+
+        set({
+          observability: {
+            traceEvents,
+            ragSources,
+            toolEvents,
+            budgetAudit: meta.budget_audit,
+            sessionSummary,
+            userFacts,
+          },
+        });
+      },
 
       getActiveSession: () => {
         const { sessions, activeSessionId } = get();
@@ -141,6 +214,37 @@ export const useAppStore = create<AppState>()(
     {
       name: "genai-dashboard-store",
       version: 2,
+      merge: (persistedState, currentState) => {
+        const persisted = persistedState as Partial<AppState> | undefined;
+        const current = currentState as AppState;
+
+        if (!persisted) {
+          return current;
+        }
+
+        const persistedObservability = persisted.observability ?? {};
+        const currentObservability = current.observability;
+
+        return {
+          ...current,
+          ...persisted,
+          settings: {
+            ...current.settings,
+            ...persisted.settings,
+          },
+          observability: {
+            ...currentObservability,
+            ...persistedObservability,
+            traceEvents: persistedObservability.traceEvents ?? currentObservability.traceEvents,
+            ragSources: persistedObservability.ragSources ?? currentObservability.ragSources,
+            toolEvents: persistedObservability.toolEvents ?? currentObservability.toolEvents,
+            budgetAudit: persistedObservability.budgetAudit ?? currentObservability.budgetAudit,
+            sessionSummary:
+              persistedObservability.sessionSummary ?? currentObservability.sessionSummary,
+            userFacts: persistedObservability.userFacts ?? currentObservability.userFacts,
+          },
+        };
+      },
       migrate: (persistedState: unknown, version: number) => {
         if (!persistedState || typeof persistedState !== "object") {
           return persistedState as AppState;

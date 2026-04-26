@@ -10,13 +10,14 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 
 logger = logging.getLogger(__name__)
+GEMINI_MIN_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True, slots=True)
 class LLMClientConfig:
     model_name: str = "gemini-2.5-flash"
     temperature: float = 0.2
-    timeout_seconds: int = 20
+    timeout_seconds: float = 20.0
     fallback_models: tuple[str, ...] = (
         "gemini-1.5-flash",
         "gemini-flash-latest",
@@ -106,7 +107,26 @@ def get_llm_debug_key_info() -> dict[str, object]:
 
 def create_llm_client(config: LLMClientConfig | None = None) -> ChatGoogleGenerativeAI:
     cfg = config or LLMClientConfig()
-    timeout_seconds = max(cfg.timeout_seconds, 10)
+    requested_timeout_seconds = float(cfg.timeout_seconds) if float(cfg.timeout_seconds) > 0 else 20.0
+    timeout_seconds = max(requested_timeout_seconds, GEMINI_MIN_TIMEOUT_SECONDS)
+    if timeout_seconds != requested_timeout_seconds:
+        logger.warning(
+            "llm_timeout_adjusted_to_provider_minimum",
+            extra={
+                "requested_timeout_seconds": requested_timeout_seconds,
+                "effective_timeout_seconds": timeout_seconds,
+                "provider_minimum_seconds": GEMINI_MIN_TIMEOUT_SECONDS,
+            },
+        )
+    logger.info(
+        "llm_client_create",
+        extra={
+            "model": cfg.model_name,
+            "requested_timeout_seconds": requested_timeout_seconds,
+            "timeout_seconds": timeout_seconds,
+            "temperature": cfg.temperature,
+        },
+    )
     return ChatGoogleGenerativeAI(
         model=cfg.model_name,
         temperature=cfg.temperature,

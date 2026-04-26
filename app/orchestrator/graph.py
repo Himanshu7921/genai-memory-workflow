@@ -24,8 +24,12 @@ from app.retrieval.service import RetrievalService
 
 @dataclass(slots=True)
 class NodeConfig:
-    retries: int = 2
+    retries: int = 0
     retry_backoff_seconds: float = 0.1
+    per_node_retries: dict[str, int] = field(default_factory=lambda: {"memory_write_back": 1, "response_generation": 1})
+
+    def retries_for(self, node_name: str) -> int:
+        return self.per_node_retries.get(node_name, self.retries)
 
 
 @dataclass(slots=True)
@@ -86,7 +90,8 @@ class OrchestrationGraph:
 
     def _run_node_with_retry(self, *, node_name: str, node: Node, state: OrchestrationState, logger: TraceLogger) -> OrchestrationState:
         last_error: Exception | None = None
-        for attempt in range(self.node_config.retries + 1):
+        retries = self.node_config.retries_for(node_name)
+        for attempt in range(retries + 1):
             started = perf_counter()
             logger.log_node_start(node_name, attempt)
             event = OrchestrationEvent(
@@ -105,6 +110,7 @@ class OrchestrationGraph:
                 event.finished_at = datetime.utcnow()
                 event.success = True
                 event.duration_ms = duration_ms
+                state.metadata.setdefault("node_timings_ms", {})[node_name] = duration_ms
                 state.trace.events.append(event)
                 logger.log_node_end(node_name, True, duration_ms)
                 return state
@@ -115,9 +121,10 @@ class OrchestrationGraph:
                 event.success = False
                 event.duration_ms = duration_ms
                 event.metadata["error"] = str(exc)
+                state.metadata.setdefault("node_timings_ms", {})[f"{node_name}_attempt_{attempt}"] = duration_ms
                 state.trace.events.append(event)
                 logger.log_node_end(node_name, False, duration_ms, {"error": str(exc)})
-                if attempt < self.node_config.retries:
+                if attempt < retries:
                     continue
                 state.errors.append(f"{node_name}:{exc}")
                 logger.log_warning(f"node_failed_after_retries:{node_name}", {"error": str(exc)})

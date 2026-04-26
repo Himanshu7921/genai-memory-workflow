@@ -13,7 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { useAppStore } from "@/store/useAppStore";
+import { DEFAULT_BACKEND_BASE_URL, useAppStore } from "@/store/useAppStore";
 
 export function SettingsDialog() {
   const settings = useAppStore((s) => s.settings);
@@ -26,7 +26,7 @@ export function SettingsDialog() {
 
   function save() {
     setSettings({
-      baseUrl: baseUrl.trim().replace(/\/$/, ""),
+      baseUrl: baseUrl.trim().replace(/\/$/, "") || DEFAULT_BACKEND_BASE_URL,
       userId: userId.trim() || settings.userId,
       debugMode: debug,
     });
@@ -39,7 +39,7 @@ export function SettingsDialog() {
       onOpenChange={(o) => {
         setOpen(o);
         if (o) {
-          setBaseUrl(settings.baseUrl);
+          setBaseUrl(settings.baseUrl || DEFAULT_BACKEND_BASE_URL);
           setUserId(settings.userId);
           setDebug(settings.debugMode);
         }
@@ -72,11 +72,7 @@ export function SettingsDialog() {
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="userId">user_id</Label>
-            <Input
-              id="userId"
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
-            />
+            <Input id="userId" value={userId} onChange={(e) => setUserId(e.target.value)} />
             <p className="text-[11px] text-muted-foreground">
               Same user_id across sessions reuses L3 user memory.
             </p>

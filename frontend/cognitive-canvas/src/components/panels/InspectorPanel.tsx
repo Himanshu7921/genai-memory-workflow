@@ -1,13 +1,5 @@
 import { useState } from "react";
-import {
-  Brain,
-  FileText,
-  Wrench,
-  Gauge,
-  Activity,
-  Code,
-  ChevronRight,
-} from "lucide-react";
+import { Brain, FileText, Wrench, Gauge, Activity, Code, ChevronRight } from "lucide-react";
 import { useAppStore } from "@/store/useAppStore";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -23,17 +15,20 @@ import type {
 export function InspectorPanel() {
   const meta = useAppStore((s) => s.getLatestMeta());
   const debug = useAppStore((s) => s.settings.debugMode);
+  const observability = useAppStore((s) => s.observability);
+  const userFacts = observability.userFacts ?? [];
+  const ragSources = observability.ragSources ?? [];
+  const toolEvents = observability.toolEvents ?? [];
+  const traceEvents = observability.traceEvents ?? [];
 
-  const l2: MemoryL2 | undefined = meta?.memory?.l2;
-  const l3: MemoryL3 | undefined = meta?.memory?.l3;
-  const docs: RetrievedChunk[] =
-    meta?.retrieved_chunks ??
-    meta?.sources ??
-    meta?.memory?.l4 ??
-    [];
-  const tools: ToolCall[] = meta?.tool_calls ?? meta?.tools ?? [];
-  const budget: BudgetAudit | undefined = meta?.budget_audit;
-  const trace: TraceStep[] = meta?.trace ?? [];
+  const l2: MemoryL2 | undefined =
+    meta?.memory?.l2 ?? (observability.sessionSummary ? { summary: observability.sessionSummary } : undefined);
+  const l3: MemoryL3 | undefined =
+    meta?.memory?.l3 ?? (userFacts.length > 0 ? { facts: userFacts } : undefined);
+  const docs: RetrievedChunk[] = (meta?.retrieved_chunks?.length ? meta.retrieved_chunks : ragSources) ?? [];
+  const tools: ToolCall[] = (meta?.tool_calls?.length ? meta.tool_calls : toolEvents) ?? [];
+  const budget: BudgetAudit | undefined = meta?.budget_audit ?? observability.budgetAudit;
+  const trace: TraceStep[] = meta?.trace?.length ? meta.trace : traceEvents;
 
   return (
     <aside className="flex h-full w-full flex-col border-l border-border bg-card/40">
@@ -106,27 +101,14 @@ function TabTrigger({
   );
 }
 
-function SectionTitle({
-  color,
-  label,
-  hint,
-}: {
-  color: string;
-  label: string;
-  hint?: string;
-}) {
+function SectionTitle({ color, label, hint }: { color: string; label: string; hint?: string }) {
   return (
     <div className="mb-2 flex items-center gap-2">
-      <span
-        className="h-2 w-2 rounded-full"
-        style={{ backgroundColor: `var(--color-${color})` }}
-      />
+      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: `var(--color-${color})` }} />
       <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
         {label}
       </p>
-      {hint && (
-        <p className="ml-auto text-[10px] text-muted-foreground">{hint}</p>
-      )}
+      {hint && <p className="ml-auto text-[10px] text-muted-foreground">{hint}</p>}
     </div>
   );
 }
@@ -143,14 +125,29 @@ function MemoryView({ l2, l3 }: { l2?: MemoryL2; l3?: MemoryL3 }) {
   const facts = l3?.facts ?? [];
   const pinned = l3?.pinned ?? [];
   const contradictions = l3?.contradictions_resolved ?? [];
+  const [expanded, setExpanded] = useState(false);
+  const summary = l2?.summary?.trim() ?? "";
+  const collapsedSummary = summary.length > 260 ? `${summary.slice(0, 260).trimEnd()}…` : summary;
+  const showToggle = summary.length > 260;
 
   return (
     <>
       <div>
         <SectionTitle color="l2" label="L2 · Session memory" />
-        {l2?.summary ? (
+        {summary ? (
           <div className="rounded-lg border border-border bg-card p-3 text-xs leading-relaxed">
-            {l2.summary}
+            <div className="max-h-52 overflow-auto whitespace-pre-wrap break-words pr-1 text-sm leading-6 text-card-foreground">
+              {expanded ? summary : collapsedSummary}
+            </div>
+            {showToggle && (
+              <button
+                type="button"
+                onClick={() => setExpanded((current) => !current)}
+                className="mt-2 text-[11px] font-medium text-primary underline-offset-4 hover:underline"
+              >
+                {expanded ? "Show less" : "Show more"}
+              </button>
+            )}
           </div>
         ) : (
           <EmptyHint>Session summary will appear after first reply.</EmptyHint>
@@ -178,11 +175,11 @@ function MemoryView({ l2, l3 }: { l2?: MemoryL2; l3?: MemoryL3 }) {
         {facts.length === 0 ? (
           <EmptyHint>No persistent user facts yet.</EmptyHint>
         ) : (
-          <ul className="space-y-1.5">
+          <ul className="max-h-60 space-y-1.5 overflow-auto pr-1">
             {facts.map((f, i) => {
               const isStr = typeof f === "string";
-              const key = isStr ? `fact_${i}` : f.key ?? `fact_${i}`;
-              const value = isStr ? f : f.value ?? JSON.stringify(f);
+              const key = isStr ? `fact_${i}` : (f.key ?? `fact_${i}`);
+              const value = isStr ? f : (f.value ?? JSON.stringify(f));
               const conf = !isStr ? f.confidence : undefined;
               const isPinned = !isStr && f.pinned;
               return (
@@ -191,10 +188,8 @@ function MemoryView({ l2, l3 }: { l2?: MemoryL2; l3?: MemoryL3 }) {
                   className="flex items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs"
                 >
                   <div className="min-w-0 flex-1">
-                    <p className="font-mono text-[10px] text-muted-foreground">
-                      {key}
-                    </p>
-                    <p className="truncate">{String(value)}</p>
+                    <p className="font-mono text-[10px] text-muted-foreground">{key}</p>
+                    <p className="whitespace-pre-wrap break-words leading-5">{String(value)}</p>
                   </div>
                   {conf !== undefined && (
                     <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
@@ -218,10 +213,7 @@ function MemoryView({ l2, l3 }: { l2?: MemoryL2; l3?: MemoryL3 }) {
           <SectionTitle color="l3" label="Pinned" />
           <ul className="space-y-1">
             {pinned.map((p, i) => (
-              <li
-                key={i}
-                className="rounded-md bg-primary/5 px-2 py-1 text-xs text-primary"
-              >
+              <li key={i} className="rounded-md bg-primary/5 px-2 py-1 text-xs text-primary">
                 {p}
               </li>
             ))}
@@ -234,13 +226,8 @@ function MemoryView({ l2, l3 }: { l2?: MemoryL2; l3?: MemoryL3 }) {
           <SectionTitle color="l3" label="Contradictions resolved" />
           <ul className="space-y-1.5">
             {contradictions.map((c, i) => (
-              <li
-                key={i}
-                className="rounded-lg border border-border bg-card p-2 text-[11px]"
-              >
-                <span className="line-through text-muted-foreground">
-                  {c.from}
-                </span>
+              <li key={i} className="rounded-lg border border-border bg-card p-2 text-[11px]">
+                <span className="line-through text-muted-foreground">{c.from}</span>
                 <ChevronRight className="mx-1 inline h-3 w-3" />
                 <span className="font-medium">{c.to}</span>
               </li>
@@ -265,17 +252,26 @@ function RagView({ docs }: { docs: RetrievedChunk[] }) {
       ) : (
         <ul className="space-y-2">
           {docs.map((d, i) => {
-            const text = d.content ?? d.text ?? "";
+            const metadata = d.metadata && typeof d.metadata === "object" ? d.metadata : undefined;
+            const text =
+              d.content ??
+              d.text ??
+              (typeof metadata?.content === "string" ? metadata.content : "") ??
+              (typeof metadata?.text === "string" ? metadata.text : "") ??
+              (typeof metadata?.chunk_content === "string" ? metadata.chunk_content : "") ??
+              (typeof metadata?.snippet === "string" ? metadata.snippet : "");
             const score = d.score;
+            const documentId = d.document_id ?? (typeof metadata?.document_id === "string" ? metadata.document_id : "");
+            const chunkId = d.chunk_id ?? d.id ?? (typeof metadata?.chunk_id === "string" ? metadata.chunk_id : `chunk_${i + 1}`);
             return (
-              <li
-                key={i}
-                className="rounded-lg border border-border bg-card p-3"
-              >
-                <div className="mb-1.5 flex items-center justify-between gap-2">
-                  <p className="truncate text-xs font-medium">
-                    {d.title ?? d.source ?? d.document_id ?? `chunk_${i + 1}`}
-                  </p>
+              <li key={chunkId} className="rounded-lg border border-border bg-card p-3">
+                <div className="mb-2 flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-xs font-semibold text-card-foreground">
+                      {d.title ?? d.source ?? documentId ?? `Chunk ${i + 1}`}
+                    </p>
+                    <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">chunk_id: {chunkId}</p>
+                  </div>
                   {score !== undefined && (
                     <span
                       className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]"
@@ -288,9 +284,19 @@ function RagView({ docs }: { docs: RetrievedChunk[] }) {
                     </span>
                   )}
                 </div>
-                <p className="line-clamp-3 text-[11px] leading-relaxed text-muted-foreground">
-                  {text || "—"}
-                </p>
+                <div className="mb-2 grid grid-cols-2 gap-2 text-[10px] text-muted-foreground">
+                  <div className="rounded-md bg-muted/40 px-2 py-1">
+                    <span className="font-semibold text-foreground/80">Document:</span> {documentId || "—"}
+                  </div>
+                  <div className="rounded-md bg-muted/40 px-2 py-1">
+                    <span className="font-semibold text-foreground/80">Chunk:</span> {chunkId}
+                  </div>
+                </div>
+                <div className="max-h-44 overflow-auto rounded-md border border-border/60 bg-background p-2">
+                  <p className="whitespace-pre-wrap break-words text-[11px] leading-5 text-muted-foreground">
+                    {text || "Content not included in this response."}
+                  </p>
+                </div>
                 {score !== undefined && (
                   <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
                     <div
@@ -324,12 +330,12 @@ function ToolsView({ tools }: { tools: ToolCall[] }) {
       ) : (
         <ul className="space-y-2">
           {tools.map((t, i) => (
-            <li
-              key={i}
-              className="rounded-lg border border-border bg-card p-3 text-xs"
-            >
+            <li key={i} className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="mb-1 flex items-center justify-between gap-2">
-                <p className="font-mono text-xs font-medium">{t.name}</p>
+                <div className="min-w-0">
+                  <p className="font-mono text-xs font-semibold text-card-foreground">Tool: {t.name}</p>
+                  <p className="text-[10px] text-muted-foreground">{t.type ?? "tool"}</p>
+                </div>
                 <div className="flex items-center gap-1.5">
                   {t.status && (
                     <span
@@ -350,9 +356,24 @@ function ToolsView({ tools }: { tools: ToolCall[] }) {
                   )}
                 </div>
               </div>
-              <pre className="scroll-thin max-h-32 overflow-auto rounded bg-muted/60 p-2 font-mono text-[10px]">
-                {JSON.stringify(t.output ?? t.result ?? t.input ?? {}, null, 2)}
-              </pre>
+              <div className="grid gap-2">
+                <div className="rounded-md border border-border/60 bg-background p-2">
+                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Input
+                  </p>
+                  <pre className="scroll-thin max-h-28 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-5">
+                    {JSON.stringify(t.input ?? t.metadata?.input ?? t.metadata?.arguments ?? {}, null, 2)}
+                  </pre>
+                </div>
+                <div className="rounded-md border border-border/60 bg-background p-2">
+                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Output
+                  </p>
+                  <pre className="scroll-thin max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-5">
+                    {JSON.stringify(t.output ?? t.result ?? t.metadata?.output ?? t.metadata?.result ?? {}, null, 2)}
+                  </pre>
+                </div>
+              </div>
             </li>
           ))}
         </ul>
@@ -373,8 +394,7 @@ function BudgetView({ budget }: { budget?: BudgetAudit }) {
 
   const allocation = budget.allocation ?? {};
   const total =
-    budget.total_tokens ??
-    Object.values(allocation).reduce((a, b) => a + (Number(b) || 0), 0);
+    budget.total_tokens ?? Object.values(allocation).reduce((a, b) => a + (Number(b) || 0), 0);
   const used = budget.used_tokens;
   const remaining = budget.remaining_tokens;
 
@@ -383,7 +403,11 @@ function BudgetView({ budget }: { budget?: BudgetAudit }) {
 
   return (
     <>
-      <SectionTitle color="chart-1" label="Token budget" hint={total ? `${total} tok` : undefined} />
+      <SectionTitle
+        color="chart-1"
+        label="Token budget"
+        hint={total ? `${total} tok` : undefined}
+      />
 
       {entries.length > 0 && (
         <>
@@ -404,19 +428,14 @@ function BudgetView({ budget }: { budget?: BudgetAudit }) {
           </div>
           <ul className="mt-3 space-y-1.5">
             {entries.map(([k, v], i) => (
-              <li
-                key={k}
-                className="flex items-center gap-2 text-xs"
-              >
+              <li key={k} className="flex items-center gap-2 text-xs">
                 <span
                   className="h-2 w-2 shrink-0 rounded-full"
                   style={{
                     backgroundColor: `var(--color-${palette[i % palette.length]})`,
                   }}
                 />
-                <span className="capitalize text-muted-foreground">
-                  {k.replace(/_/g, " ")}
-                </span>
+                <span className="capitalize text-muted-foreground">{k.replace(/_/g, " ")}</span>
                 <span className="ml-auto font-mono">{v}</span>
               </li>
             ))}
@@ -426,12 +445,8 @@ function BudgetView({ budget }: { budget?: BudgetAudit }) {
 
       {(used !== undefined || remaining !== undefined) && (
         <div className="mt-3 grid grid-cols-2 gap-2">
-          {used !== undefined && (
-            <Stat label="Used" value={`${used}`} />
-          )}
-          {remaining !== undefined && (
-            <Stat label="Remaining" value={`${remaining}`} />
-          )}
+          {used !== undefined && <Stat label="Used" value={`${used}`} />}
+          {remaining !== undefined && <Stat label="Remaining" value={`${remaining}`} />}
         </div>
       )}
 
@@ -461,9 +476,7 @@ function BudgetView({ budget }: { budget?: BudgetAudit }) {
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border bg-card p-2">
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </p>
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
       <p className="font-mono text-sm">{value}</p>
     </div>
   );
@@ -482,20 +495,29 @@ function TraceView({ trace }: { trace: TraceStep[] }) {
               <span className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-primary ring-4 ring-background" />
               <div className="rounded-lg border border-border bg-card p-2.5">
                 <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-medium capitalize">
-                    {s.label ?? s.step}
-                  </p>
-                  {s.latency_ms !== undefined && (
-                    <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-                      {s.latency_ms}ms
-                    </span>
-                  )}
+                  <p className="text-xs font-medium">{s.step}</p>
+                  <div className="flex items-center gap-1.5">
+                    {s.detail && (
+                      <span
+                        className={cn(
+                          "rounded px-1.5 py-0.5 text-[10px]",
+                          s.detail === "success"
+                            ? "bg-emerald-500/15 text-emerald-400"
+                            : s.detail === "failed"
+                              ? "bg-destructive/15 text-destructive"
+                              : "bg-muted text-muted-foreground",
+                        )}
+                      >
+                        {s.detail}
+                      </span>
+                    )}
+                    {s.latency_ms !== undefined && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                        {s.latency_ms}ms
+                      </span>
+                    )}
+                  </div>
                 </div>
-                {s.detail && (
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    {s.detail}
-                  </p>
-                )}
               </div>
             </li>
           ))}

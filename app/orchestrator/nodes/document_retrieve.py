@@ -30,7 +30,7 @@ class DocumentRetrievalNode:
             user_id=state.turn.user_id,
             document_ids=state.turn.document_ids,
             top_k=5,
-            min_score=0.5,
+            min_score=0.2,
         )
         result = self.retrieval_service.retrieve(request)
         state.retrieval_context = result.context

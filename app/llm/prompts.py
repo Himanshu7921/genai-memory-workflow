@@ -15,29 +15,29 @@ class PromptBundle:
 def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str | None = None) -> PromptBundle:
     summary = ""
     if state.memory_snapshot and state.memory_snapshot.summary:
-        summary = state.memory_snapshot.summary.summary.strip()
+        summary = state.memory_snapshot.summary.summary.strip()[:500]
 
     user_facts_lines: list[str] = []
     pinned_lines: list[str] = []
     if state.memory_snapshot:
-        for fact in state.memory_snapshot.user_facts:
+        for fact in state.memory_snapshot.user_facts[:8]:
             if fact.status == FactStatus.ACTIVE and fact.value.strip():
-                user_facts_lines.append(f"- {fact.canonical_key}: {fact.value.strip()}")
-        for fact in state.memory_snapshot.pinned_facts:
+                user_facts_lines.append(f"- {fact.canonical_key}: {fact.value.strip()[:140]}")
+        for fact in state.memory_snapshot.pinned_facts[:5]:
             if fact.value.strip():
-                pinned_lines.append(f"- {fact.canonical_key}: {fact.value.strip()} ({fact.reason})")
+                pinned_lines.append(f"- {fact.canonical_key}: {fact.value.strip()[:140]} ({fact.reason})")
 
     document_lines: list[str] = []
     if state.retrieval_context:
-        for chunk in state.retrieval_context.chunks:
+        for chunk in state.retrieval_context.chunks[:3]:
             snippet = chunk.content.strip().replace("\n", " ")
             document_lines.append(
-                f"- doc={chunk.document_id} chunk={chunk.chunk_id} score={chunk.score:.3f}: {snippet[:500]}"
+                f"- doc={chunk.document_id} chunk={chunk.chunk_id} score={chunk.score:.3f}: {snippet[:220]}"
             )
 
     tool_lines: list[str] = []
     if state.tool_results:
-        for result in state.tool_results.results:
+        for result in state.tool_results.results[:2]:
             if result.success:
                 tool_lines.append(f"- {result.tool_name}: {_format_tool_result(result.output)}")
             else:
@@ -47,10 +47,10 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
     system_instruction = (
         "You are a production assistant providing concise, direct answers. "
         "Rules:\n"
-        "1. Answer the user query directly and concisely. Avoid unnecessary explanations or preamble.\n"
-        "2. Use provided context (memory facts, documents, tool results) when relevant.\n"
+        "1. Answer directly in plain language with minimal verbosity.\n"
+        "2. Use provided context (memory, docs, tools) only when relevant.\n"
         "3. Do NOT ask follow-up questions unless explicitly required by the user.\n"
-        "4. Do NOT add assistant-style fluff like 'Thank you for asking' or 'I'd be happy to help'.\n"
+        "4. Do NOT add filler text or assistant-style preamble.\n"
         "5. Avoid over-personalization: use neutral phrasing like 'Based on your profile' instead of using user names or assumptions.\n"
         "6. If context is insufficient, state that clearly without asking follow-up questions.\n"
         "7. Do not output raw JSON, Python dicts, internal metadata, or debugging artifacts.\n"

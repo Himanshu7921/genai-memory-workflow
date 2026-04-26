@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import re
+from time import perf_counter
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -29,13 +30,9 @@ class ResponseGenerationNode:
     name: str = "response_generation"
     llm_temperature: float = 0.2
     llm_model: str = "gemini-flash-lite-latest"
-    llm_timeout_seconds: int = 20
-    llm_fallback_models: tuple[str, ...] = (
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash",
-    )
+    llm_timeout_seconds: float = 4.0
+    llm_invoke_retries: int = 1
+    llm_fallback_models: tuple[str, ...] = ()
 
     def run(self, state: OrchestrationState) -> NodeResult:
         sources: list[dict] = []
@@ -72,7 +69,7 @@ class ResponseGenerationNode:
             state.metadata["response_memory_match"] = memory_answer
             state.metadata["response_memory_source"] = memory_source
 
-        # ALWAYS route through LLM (this is the critical fix)
+        # ALWAYS route through LLM. Fallback is only allowed when LLM call fails.
         llm_answer = self._generate_with_llm(state, memory_answer=memory_answer)
         
         if llm_answer:
@@ -84,9 +81,15 @@ class ResponseGenerationNode:
             used_llm = False
 
         state.metadata["response_used_llm"] = used_llm
+        state.metadata["llm_status"] = "success" if used_llm else "failed"
         state.metadata["response_generation_mode"] = "llm" if used_llm else "local"
         if not used_llm and "response_llm_error" in state.metadata:
             state.metadata["response_fallback_reason"] = "llm_error"
+            state.metadata["fallback_reason"] = str(state.metadata.get("response_llm_error"))
+        elif not used_llm:
+            state.metadata["fallback_reason"] = "llm_no_content"
+        else:
+            state.metadata["fallback_reason"] = ""
 
         state.response = GeneratedResponse(
             final_answer=final_answer,
@@ -102,13 +105,24 @@ class ResponseGenerationNode:
 
     def _generate_with_llm(self, state: OrchestrationState, memory_answer: str | None = None) -> str | None:
         prompt = build_response_prompt_bundle(state, memory_answer=memory_answer)
+        logger.info(
+            "LLM_CALL_STARTED",
+            extra={
+                "node": self.name,
+                "model": self.llm_model,
+                "timeout_seconds": self.llm_timeout_seconds,
+                "system_chars": len(prompt.system_instruction),
+                "user_chars": len(prompt.user_prompt),
+            },
+        )
         state.metadata["response_llm_request"] = {
             "primary_model": self.llm_model,
             "candidate_models": build_model_candidates(self.llm_model, self.llm_fallback_models),
             "temperature": self.llm_temperature,
-            "timeout_seconds": max(self.llm_timeout_seconds, 10),
+            "timeout_seconds": self.llm_timeout_seconds,
             "system_chars": len(prompt.system_instruction),
             "user_chars": len(prompt.user_prompt),
+            "prompt_tokens_estimate": int((len(prompt.system_instruction) + len(prompt.user_prompt)) / 4),
             **get_llm_debug_key_info(),
         }
 
@@ -142,30 +156,42 @@ class ResponseGenerationNode:
                 )
                 continue
 
-            try:
-                response = llm.invoke(
-                    [
-                        SystemMessage(content=prompt.system_instruction),
-                        HumanMessage(content=prompt.user_prompt),
-                    ]
-                )
-            except Exception as exc:
-                mark_llm_failure()
-                error_category, is_quota_error = classify_llm_error(exc)
-                attempt_errors.append(
-                    {
-                        "stage": "invoke",
-                        "model": model_name,
-                        "error_type": type(exc).__name__,
-                        "error_category": error_category,
-                        "quota_exceeded": is_quota_error,
-                        "error": str(exc),
-                    }
-                )
-                logger.warning(
-                    "response_generation_llm_invoke_failed",
-                    extra={"model": model_name, "error": str(exc), "error_type": type(exc).__name__},
-                )
+            response = None
+            for invoke_attempt in range(self.llm_invoke_retries + 1):
+                try:
+                    invoke_start = perf_counter()
+                    response = llm.invoke(
+                        [
+                            SystemMessage(content=prompt.system_instruction),
+                            HumanMessage(content=prompt.user_prompt),
+                        ]
+                    )
+                    state.metadata["response_llm_invoke_ms"] = int((perf_counter() - invoke_start) * 1000)
+                    break
+                except Exception as exc:
+                    mark_llm_failure()
+                    error_category, is_quota_error = classify_llm_error(exc)
+                    attempt_errors.append(
+                        {
+                            "stage": "invoke",
+                            "model": model_name,
+                            "invoke_attempt": invoke_attempt,
+                            "error_type": type(exc).__name__,
+                            "error_category": error_category,
+                            "quota_exceeded": is_quota_error,
+                            "error": str(exc),
+                        }
+                    )
+                    logger.warning(
+                        "response_generation_llm_invoke_failed",
+                        extra={
+                            "model": model_name,
+                            "invoke_attempt": invoke_attempt,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+            if response is None:
                 continue
 
             content = getattr(response, "content", "")
@@ -189,12 +215,31 @@ class ResponseGenerationNode:
                     continue
 
             mark_llm_success()
+            logger.info(
+                "LLM_CALL_SUCCESS",
+                extra={
+                    "node": self.name,
+                    "model": model_name,
+                    "invoke_ms": state.metadata.get("response_llm_invoke_ms"),
+                    "invoke_retries": self.llm_invoke_retries,
+                },
+            )
             state.metadata["response_llm_model"] = model_name
             state.metadata["response_llm_attempts"] = len(attempt_errors) + 1
             return answer
 
         if attempt_errors:
             last = attempt_errors[-1]
+            logger.warning(
+                "LLM_CALL_FAILED",
+                extra={
+                    "node": self.name,
+                    "model": last.get("model"),
+                    "error_type": last.get("error_type"),
+                    "error_category": last.get("error_category"),
+                    "error": last.get("error"),
+                },
+            )
             state.metadata["response_llm_error"] = f"{last.get('error_type')}: {last.get('error')}"
             state.metadata["response_llm_error_type"] = str(last.get("error_type", "unknown"))
             state.metadata["response_llm_error_category"] = str(last.get("error_category", "unknown"))
@@ -274,7 +319,7 @@ class ResponseGenerationNode:
         if state.retrieval_context.empty or not state.retrieval_context.chunks:
             return "No relevant information found in the available documents."
         best_score = max((chunk.score for chunk in state.retrieval_context.chunks), default=0.0)
-        if best_score < 0.5:
+        if best_score < 0.2:
             return "No relevant information found in the available documents."
         return None
 

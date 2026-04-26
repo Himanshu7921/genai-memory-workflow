@@ -8,8 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.chat import router as chat_router
+from app.api.ingest import router as ingest_router
 from app.api.dependencies import build_container
 from app.api.middleware import request_id_middleware
+from app.services.ingest_service import configure_ingest_service, ingest_all_documents
 
 
 def _sanitize_for_json(value: Any) -> Any:
@@ -44,6 +46,13 @@ def create_app() -> FastAPI:
     )
     app.middleware("http")(request_id_middleware)
     app.include_router(chat_router)
+    app.include_router(ingest_router)
+
+    @app.on_event("startup")
+    async def startup_ingestion() -> None:
+        container = app.state.container
+        configure_ingest_service(container.retrieval_service)
+        ingest_all_documents()
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):

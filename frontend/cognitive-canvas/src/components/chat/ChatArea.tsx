@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { Send, Paperclip, Bot, User, Loader2, AlertCircle } from "lucide-react";
-import { useAppStore } from "@/store/useAppStore";
+import { DEFAULT_BACKEND_BASE_URL, useAppStore } from "@/store/useAppStore";
 import { postChat } from "@/services/api";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -25,10 +25,13 @@ export function ChatArea() {
   const appendMessage = useAppStore((s) => s.appendMessage);
   const updateMessage = useAppStore((s) => s.updateMessage);
   const createSession = useAppStore((s) => s.createSession);
+  const clearObservability = useAppStore((s) => s.clearObservability);
+  const setObservabilityFromMeta = useAppStore((s) => s.setObservabilityFromMeta);
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const backendBaseUrl = settings.baseUrl.trim() || DEFAULT_BACKEND_BASE_URL;
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -61,23 +64,11 @@ export function ChatArea() {
       createdAt: Date.now(),
       pending: true,
     });
-
-    if (!settings.baseUrl) {
-      updateMessage(sid, assistantId, {
-        pending: false,
-        error:
-          "Backend URL not configured. Open Settings (top-right) and paste your /chat endpoint base URL.",
-      });
-      return;
-    }
+    clearObservability();
 
     setSending(true);
     try {
-      const docs =
-        useAppStore
-          .getState()
-          .sessions.find((s) => s.id === sid)
-          ?.documentIds ?? [];
+      const docs = useAppStore.getState().sessions.find((s) => s.id === sid)?.documentIds ?? [];
       const resp = await postChat(
         {
           user_id: settings.userId,
@@ -85,8 +76,18 @@ export function ChatArea() {
           message: text,
           document_ids: docs,
         },
-        { baseUrl: settings.baseUrl },
+        { baseUrl: backendBaseUrl },
       );
+
+      const { final_answer, sources, budget_audit, trace } = resp;
+      void final_answer;
+      void sources;
+      void budget_audit;
+      void trace;
+
+      setTimeout(() => {
+        setObservabilityFromMeta(resp);
+      }, 0);
 
       // Simulate streaming by progressively revealing the answer
       const full = resp.final_answer ?? "";
@@ -135,10 +136,7 @@ export function ChatArea() {
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <div
-        ref={scrollRef}
-        className="scroll-thin flex-1 overflow-y-auto px-4 py-6 sm:px-8"
-      >
+      <div ref={scrollRef} className="scroll-thin flex-1 overflow-y-auto px-4 py-6 sm:px-8">
         <div className="mx-auto max-w-3xl space-y-6">
           {(!session || session.messages.length === 0) && <EmptyState />}
           {session?.messages.map((m) => (
@@ -188,8 +186,7 @@ export function ChatArea() {
             user_id <span className="font-mono">{settings.userId}</span>
             {session && (
               <>
-                {" · "}session_id{" "}
-                <span className="font-mono">{session.id.slice(0, 8)}</span>
+                {" · "}session_id <span className="font-mono">{session.id.slice(0, 8)}</span>
               </>
             )}
           </p>
@@ -244,19 +241,27 @@ function MessageBubble({ m }: { m: ChatMessage }) {
         <div
           className={cn(
             "mt-1.5 text-[10px]",
-            isUser
-              ? "text-primary-foreground/70"
-              : "text-muted-foreground",
+            isUser ? "text-primary-foreground/70" : "text-muted-foreground",
           )}
         >
           {formatTime(m.createdAt)}
-          {m.meta?.used_llm && (
-            <span className="ml-2">· {m.meta.used_llm}</span>
+          {m.meta?.used_llm !== undefined && (
+            <span
+              className={cn(
+                "ml-2 rounded-full px-1.5 py-0.5 font-medium",
+                m.meta.used_llm
+                  ? "bg-emerald-500/15 text-emerald-400"
+                  : "bg-amber-500/15 text-amber-400",
+              )}
+            >
+              {m.meta.used_llm ? "LLM" : "fallback"}
+            </span>
+          )}
+          {m.meta?.sources && m.meta.sources.length > 0 && (
+            <span className="ml-2">· {m.meta.sources.length} sources</span>
           )}
           {m.meta?.trace_id && (
-            <span className="ml-2 font-mono">
-              · {String(m.meta.trace_id).slice(0, 8)}
-            </span>
+            <span className="ml-2 font-mono">· {String(m.meta.trace_id).slice(0, 8)}</span>
           )}
         </div>
       </div>
@@ -280,13 +285,10 @@ function EmptyState() {
       <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-2xl gradient-primary shadow-xl shadow-primary/30">
         <Bot className="h-7 w-7 text-primary-foreground" />
       </div>
-      <h2 className="text-2xl font-semibold tracking-tight">
-        Start a new conversation
-      </h2>
+      <h2 className="text-2xl font-semibold tracking-tight">Start a new conversation</h2>
       <p className="mt-2 max-w-md text-sm text-muted-foreground">
-        Memora remembers what you discuss across sessions. Watch the right panel
-        to see memory layers, retrieved documents, tool calls, and token budget
-        in real time.
+        Memora remembers what you discuss across sessions. Watch the right panel to see memory
+        layers, retrieved documents, tool calls, and token budget in real time.
       </p>
       <div className="mt-6 grid grid-cols-2 gap-2 text-left sm:grid-cols-4">
         {[
@@ -295,10 +297,7 @@ function EmptyState() {
           { k: "L4", label: "Documents" },
           { k: "Tools", label: "Execution" },
         ].map((x) => (
-          <div
-            key={x.k}
-            className="rounded-xl border border-border bg-card p-3"
-          >
+          <div key={x.k} className="rounded-xl border border-border bg-card p-3">
             <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
               {x.k}
             </p>

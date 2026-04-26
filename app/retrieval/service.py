@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+import logging
 from typing import Any
 
 from app.core.config import DEFAULT_MEMORY_CONFIG
@@ -13,6 +14,9 @@ from app.retrieval.chunking import ChunkPlan, chunk_document_content
 from app.retrieval.keyword_fallback import keyword_search
 from app.retrieval.ranking import rerank_chunks, to_retrieval_chunks
 from app.retrieval.vector_store import ChromaVectorStore, InMemoryVectorStore, VectorStore
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -125,6 +129,16 @@ class RetrievalService:
             for hit in keyword_hits
         )
 
+        logger.info(
+            "retrieval_pre_rerank query=%r top_k=%s min_score=%s vector_hits=%s keyword_hits=%s pre_scores=%s",
+            request.query,
+            request.top_k,
+            request.min_score,
+            len(vector_hits),
+            len(keyword_hits),
+            [chunk.score for chunk in retrieval_chunks[: min(10, len(retrieval_chunks))]],
+        )
+
         initial_count = len(retrieval_chunks)
         reranked = rerank_chunks(
             retrieval_chunks,
@@ -133,10 +147,18 @@ class RetrievalService:
             max_chunks=request.top_k,
         )
 
-        # Final safety gate: treat sub-threshold results as unusable grounded context.
-        effective_min_score = max(request.min_score, 0.5)
+        effective_min_score = request.min_score
         grounded = [chunk for chunk in reranked if chunk.score >= effective_min_score]
         filtered_out = max(initial_count - len(grounded), 0)
+
+        logger.info(
+            "retrieval_post_rerank query=%r reranked_count=%s grounded_count=%s reranked_scores=%s grounded_scores=%s",
+            request.query,
+            len(reranked),
+            len(grounded),
+            [chunk.score for chunk in reranked],
+            [chunk.score for chunk in grounded],
+        )
 
         used_fallback = (not vector_hits and bool(keyword_hits)) or not grounded
         context = RetrievalContext(
