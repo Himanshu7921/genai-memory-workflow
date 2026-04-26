@@ -81,11 +81,8 @@ Every request generates a comprehensive **Trace Audit**, allowing developers to 
 # Install dependencies
 pip install -r requirements.txt
 
-# Initialize memory schema
-python scripts/init_db.py
-
 # Launch the service
-uvicorn chat:app --reload
+uvicorn app.main:app --reload
 ```
 
 ### Scaling Considerations
