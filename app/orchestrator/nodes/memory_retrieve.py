@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import logging
-import re
 from time import perf_counter
 
 from app.memory.service import MemoryService
@@ -30,7 +29,8 @@ def _get_query_embedding_provider() -> EmbeddingProvider:
 class MemoryRetrievalNode:
     name: str = "memory_retrieval"
     memory_service: MemoryService | None = None
-    min_similarity_threshold: float = 0.6
+    min_similarity_threshold: float = 0.35
+    min_fallback_similarity: float = 0.1
     semantic_top_k: int = 5
 
     def run(self, state: OrchestrationState) -> NodeResult:
@@ -39,6 +39,11 @@ class MemoryRetrievalNode:
             return NodeResult(state=state)
 
         start = perf_counter()
+        backfilled = 0
+        user_service = getattr(self.memory_service, "user", None)
+        if user_service is not None and hasattr(user_service, "backfill_missing_embeddings"):
+            backfilled = user_service.backfill_missing_embeddings(user_id=state.turn.user_id)
+        state.metadata["memory_embedding_backfilled"] = backfilled
         snapshot = self.memory_service.load(
             user_id=state.turn.user_id,
             session_id=state.turn.session_id,
@@ -48,14 +53,8 @@ class MemoryRetrievalNode:
         state.memory_budget_audit = snapshot.audit
 
         active_facts = [fact for fact in snapshot.snapshot.user_facts if fact.status == FactStatus.ACTIVE]
-        explicit_structured_query = self._is_explicit_structured_query(state.turn.message)
-        semantic_matches = self._semantic_retrieve_facts(state.turn.message, active_facts)
-        if explicit_structured_query:
-            selected_facts = active_facts
-        elif semantic_matches:
-            selected_facts = [match[0] for match in semantic_matches]
-        else:
-            selected_facts = active_facts
+        semantic_matches, threshold_used = self._semantic_retrieve_facts(state.turn.message, active_facts)
+        selected_facts = [match[0] for match in semantic_matches]
 
         similarity_scores = [
             {
@@ -67,7 +66,10 @@ class MemoryRetrievalNode:
             for fact, score in semantic_matches
         ]
         state.metadata["memory_similarity_scores"] = similarity_scores
-        state.metadata["memory_query_mode"] = "structured" if explicit_structured_query else "semantic"
+        state.metadata["memory_query_mode"] = "semantic_only"
+        state.metadata["memory_similarity_top_k"] = self.semantic_top_k
+        state.metadata["memory_similarity_threshold"] = self.min_similarity_threshold
+        state.metadata["memory_similarity_threshold_used"] = threshold_used
 
         state.turn.retrieved_memory = {
             "protected_facts": [
@@ -111,35 +113,38 @@ class MemoryRetrievalNode:
         state.metadata["memory_retrieval_duration_ms"] = int((perf_counter() - start) * 1000)
         return NodeResult(state=state)
 
-    def _semantic_retrieve_facts(self, query: str, facts: list[MemoryFact]) -> list[tuple[MemoryFact, float]]:
+    def _semantic_retrieve_facts(self, query: str, facts: list[MemoryFact]) -> tuple[list[tuple[MemoryFact, float]], float]:
         embedder = _get_query_embedding_provider()
         query_embedding = embedder.embed_text(query)
-        print("Query embedding:", query_embedding[:5])
+        print("Query embedding generated:", query_embedding[:5])
+        logger.info("Query embedding generated: %s", query_embedding[:5])
         if not facts:
-            print("Matched facts:", [])
-            return []
-        matches: list[tuple[MemoryFact, float]] = []
+            print("Top retrieved facts:", [])
+            logger.info("Top retrieved facts: []")
+            return [], self.min_similarity_threshold
+        scored: list[tuple[MemoryFact, float]] = []
         for fact in facts:
             if not fact.embedding:
                 continue
             if len(fact.embedding) != len(query_embedding):
                 continue
             score = cosine_similarity(query_embedding, fact.embedding)
-            if score >= self.min_similarity_threshold:
-                matches.append((fact, score))
+            scored.append((fact, score))
+
+        if not scored:
+            print("Top retrieved facts:", [])
+            logger.info("Top retrieved facts: []")
+            return [], self.min_similarity_threshold
+
+        matches = [item for item in scored if item[1] >= self.min_similarity_threshold]
+        threshold_used = self.min_similarity_threshold
+        if not matches:
+            matches = [item for item in scored if item[1] >= self.min_fallback_similarity]
+            threshold_used = self.min_fallback_similarity
+
         matches.sort(key=lambda item: item[1], reverse=True)
         matches = matches[: self.semantic_top_k]
-        print("Matched facts:", [(fact.value, round(score, 4)) for fact, score in matches])
-        return matches
-
-    def _is_explicit_structured_query(self, message: str) -> bool:
-        normalized = re.sub(r"\s+", " ", message.strip().lower())
-        patterns = [
-            r"\bwhat\s+is\s+my\s+name\b",
-            r"\bwho\s+am\s+i\b",
-            r"\bhow\s+old\s+am\s+i\b",
-            r"\bwhat\s+is\s+my\s+age\b",
-            r"\bwhat\s+is\s+my\s+risk\s+tolerance\b",
-            r"\bwhat\s+did\s+i\s+(?:just\s+)?say\b",
-        ]
-        return any(re.search(pattern, normalized) for pattern in patterns)
+        log_rows = [{"fact": fact.value, "score": round(score, 4)} for fact, score in matches]
+        print("Top retrieved facts:", log_rows)
+        logger.info("Top retrieved facts (threshold=%s): %s", threshold_used, log_rows)
+        return matches, threshold_used

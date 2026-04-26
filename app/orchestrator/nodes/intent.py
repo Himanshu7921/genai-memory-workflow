@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class IntentClassificationNode:
     name: str = "intent_classification"
     llm_temperature: float = 0.0
-    llm_model: str = "gemini-1.5-flash"
+    llm_model: str = "gemini-flash-lite-latest"
     llm_timeout_seconds: float = 2.0
     llm_trigger_threshold: float = 0.9
     llm_fallback_models: tuple[str, ...] = ()

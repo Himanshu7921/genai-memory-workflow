@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class ToolPlanningNode:
     name: str = "tool_planning"
     llm_temperature: float = 0.0
-    llm_model: str = "gemini-1.5-flash"
+    llm_model: str = "gemini-flash-lite-latest"
     max_tool_calls: int = 3
     llm_timeout_seconds: float = 2.5
     llm_fallback_models: tuple[str, ...] = ()

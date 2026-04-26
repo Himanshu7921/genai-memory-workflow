@@ -103,24 +103,17 @@ class ResponseGenerationNode:
     def run(self, state: OrchestrationState) -> NodeResult:
         sources: list[dict] = []
         used_llm = False
-        memory_context_text = self._build_memory_context_text(state)
-        explicit_memory_query = self._is_explicit_memory_query(state.turn.message)
-        memory_relevant, memory_similarity, matched_chunk = memory_relevance_score(
-            state.turn.message,
-            memory_context_text,
-            threshold=self.memory_relevance_threshold,
-        )
-        if state.intent and state.intent.intent == "memory_write":
-            memory_relevant = False
-        elif explicit_memory_query:
-            memory_relevant = True
+        semantic_user_facts = state.turn.retrieved_memory.get("semantic_user_facts", []) if state.turn.retrieved_memory else []
+        memory_relevant = bool(semantic_user_facts)
+        memory_similarity = max((float(item.get("score", 0.0)) for item in semantic_user_facts), default=0.0)
+        matched_chunk = semantic_user_facts[0].get("value", "") if semantic_user_facts else ""
 
         state.metadata["response_memory_relevant"] = memory_relevant
-        state.metadata["response_memory_explicit_query"] = explicit_memory_query
+        state.metadata["response_memory_explicit_query"] = False
         state.metadata["response_memory_max_similarity"] = round(memory_similarity, 4)
         state.metadata["response_memory_similarity_threshold"] = self.memory_relevance_threshold
         state.metadata["response_memory_matched_chunk"] = matched_chunk or ""
-        state.metadata["response_memory_context_chars"] = len(memory_context_text)
+        state.metadata["response_memory_context_chars"] = 0
         logger.info(
             "memory_relevance_decision",
             extra={
@@ -478,35 +471,92 @@ class ResponseGenerationNode:
         return str(output)
 
     def _answer_from_memory(self, state: OrchestrationState) -> tuple[str | None, str | None]:
-        message = state.turn.message.strip().lower()
-        if state.memory_snapshot is None:
+        semantic_facts = state.turn.retrieved_memory.get("semantic_user_facts", []) if state.turn.retrieved_memory else []
+        if not semantic_facts:
             return None, None
 
-        if "what is my name" in message or "who am i" in message:
-            answer = self._answer_name_from_memory(state)
-            if answer is not None:
-                return answer, "user_memory"
+        message = state.turn.message.strip().lower()
+        extracted = self._extract_semantic_attributes(semantic_facts)
 
-        if self._is_risk_tolerance_question(message):
-            answer = self._answer_risk_tolerance_from_memory(state)
-            if answer is not None:
-                return answer, "user_memory"
+        if "favorite anime" in message and extracted.get("favorite"):
+            return str(extracted["favorite"]), "user_memory"
 
-        if self._is_age_question(message):
-            answer = self._answer_age_from_memory(state)
-            if answer is not None:
-                return answer, "user_memory"
+        asks_many = (" and " in message or "," in message) and any(
+            token in message for token in ["name", "age", "like", "interest", "favorite", "risk"]
+        )
+        if asks_many:
+            parts: list[str] = []
+            if extracted.get("name"):
+                parts.append(f"Name: {extracted['name']}")
+            if extracted.get("age"):
+                parts.append(f"Age: {extracted['age']}")
+            if extracted.get("interest"):
+                parts.append(f"Interest: {extracted['interest']}")
+            if extracted.get("favorite"):
+                parts.append(f"Favorite: {extracted['favorite']}")
+            if extracted.get("risk_tolerance"):
+                parts.append(f"Risk tolerance: {extracted['risk_tolerance']}")
+            if parts:
+                return "; ".join(parts), "user_memory"
 
-        if self._is_preference_question(message):
-            answer = self._answer_preference_from_semantic_memory(state)
-            if answer is not None:
-                return answer, "user_memory"
+        if any(token in message for token in ["what do i like", "interests", "like in sports", "what i like"]):
+            preference = extracted.get("interest") or extracted.get("favorite")
+            if preference:
+                pref_text = str(preference).strip()
+                if pref_text.lower().startswith("you "):
+                    return pref_text.rstrip(". ") + ".", "user_memory"
+                return f"You enjoy {pref_text}.", "user_memory"
 
-        answer = self._answer_from_session_turns(state, message)
-        if answer is not None:
-            return answer, "session_memory"
+        top_values = [str(item.get("value", "")).strip() for item in semantic_facts if str(item.get("value", "")).strip()]
+        if not top_values:
+            return None, None
+        return "; ".join(top_values[:3]), "user_memory"
 
-        return None, None
+    def _extract_semantic_attributes(self, semantic_facts: list[dict]) -> dict[str, str]:
+        attributes: dict[str, str] = {}
+        for fact in semantic_facts:
+            value = str(fact.get("value", "")).strip()
+            if not value:
+                continue
+            lowered = value.lower()
+
+            name_match = re.search(
+                r"\bmy\s+name\s+is\s+([A-Za-z][A-Za-z\s'.-]{0,80}?)(?=\s+(?:and\b|but\b|my\b)|[,.!?;]|$)",
+                value,
+                re.IGNORECASE,
+            )
+            if name_match and "name" not in attributes:
+                attributes["name"] = name_match.group(1).strip(" .,!?:;\"'")
+
+            age_match = re.search(r"\b(?:i\s+am\s+)?(\d{1,3})\s*(?:years?\s+old|yrs?\s+old|yo)?\b", lowered)
+            if age_match and "age" not in attributes:
+                age = int(age_match.group(1))
+                if 0 < age < 125:
+                    attributes["age"] = str(age)
+
+            favorite_match = re.search(r"\bmy\s+favorite\s+(.+?)\s+is\s+(.+)", value, re.IGNORECASE)
+            if favorite_match and "favorite" not in attributes:
+                attributes["favorite"] = favorite_match.group(2).strip(" .,!?:;\"'")
+
+            interest_match = re.search(r"\bi\s+(?:like|enjoy|prefer)\s+(.+)", value, re.IGNORECASE)
+            if interest_match and "interest" not in attributes:
+                attributes["interest"] = interest_match.group(1).strip(" .,!?:;\"'")
+
+            risk_match = re.search(r"\b(low|medium|high|conservative|moderate|aggressive)\b", lowered)
+            if risk_match and "risk_tolerance" not in attributes and "risk" in lowered:
+                attributes["risk_tolerance"] = risk_match.group(1)
+
+            canonical_key = str(fact.get("canonical_key", "")).strip().lower()
+            if canonical_key == "name" and "name" not in attributes:
+                attributes["name"] = value
+            if canonical_key == "age" and "age" not in attributes and value.isdigit():
+                attributes["age"] = value
+            if canonical_key in {"preference", "interest"} and "interest" not in attributes:
+                attributes["interest"] = value.replace("I ", "", 1) if value.startswith("I ") else value
+            if canonical_key == "risk_tolerance" and "risk_tolerance" not in attributes:
+                attributes["risk_tolerance"] = value
+
+        return attributes
 
     def _is_explicit_memory_query(self, message: str) -> bool:
         normalized = re.sub(r"\s+", " ", message.strip().lower())

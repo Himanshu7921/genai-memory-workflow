@@ -84,6 +84,69 @@ pip install -r requirements.txt
 # Launch the service
 uvicorn app.main:app --reload
 ```
+
+## Container Setup
+
+### Files
+- Dockerfile
+- docker-compose.yml
+- .dockerignore
+- frontend/cognitive-canvas/Dockerfile
+
+### Build
+```bash
+docker compose build
+```
+
+### Run backend
+```bash
+docker compose up
+```
+
+Backend API docs:
+- http://localhost:8000/docs
+
+### Run backend + frontend (production container)
+```bash
+docker compose --profile frontend up
+```
+
+Frontend URL:
+- http://localhost:8080
+
+### Frontend dev mode (optional)
+Run frontend separately without Docker:
+```bash
+cd frontend/cognitive-canvas
+npm install
+npm run dev
+```
+
+### Environment variables
+The backend reads:
+- GEMINI_API_KEY
+- GOOGLE_API_KEY
+
+Pass them via shell env before running compose, or inline using docker run.
+
+Example with docker run:
+```bash
+docker run -p 8000:8000 \
+	-e GEMINI_API_KEY=your_key \
+	-e GOOGLE_API_KEY=your_key \
+	chronos-backend
+```
+
+### Health check
+Backend exposes:
+- GET /health
+
+Compose healthcheck uses this endpoint to track container readiness.
+
+### Seed demo data inside container
+```bash
+docker compose run --rm backend python scripts/seed_data.py
+```
 ### Frontend Setup
 ```bash
 cd frontend/cognitive-canvas

@@ -66,6 +66,7 @@ def resolve_fact_contradictions(
                 supersedes_fact_id=prior.supersedes_fact_id,
                 expires_at=prior.expires_at,
                 metadata={**prior.metadata, **fact.metadata},
+                embedding=prior.embedding or fact.embedding,
             )
             resolved.append(preserved)
             active_by_key[fact.canonical_key] = preserved
@@ -92,6 +93,7 @@ def resolve_fact_contradictions(
                 supersedes_fact_id=prior.fact_id,
                 expires_at=fact.expires_at,
                 metadata={**prior.metadata, **fact.metadata},
+                embedding=fact.embedding or prior.embedding,
             )
         resolved.append(replacement)
         active_by_key[fact.canonical_key] = replacement

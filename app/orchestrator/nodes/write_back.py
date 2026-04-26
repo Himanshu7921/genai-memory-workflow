@@ -32,7 +32,7 @@ def _get_fact_embedding_provider() -> EmbeddingProvider:
 class MemoryWriteBackNode:
     name: str = "memory_write_back"
     memory_service: MemoryService | None = None
-    max_facts_per_turn: int = 2
+    max_facts_per_turn: int = 5
 
     def run(self, state: OrchestrationState) -> NodeResult:
         if state.memory_snapshot is None or self.memory_service is None:
@@ -127,21 +127,57 @@ class MemoryWriteBackNode:
         facts = []
         text = state.turn.message.strip()
         lower = text.lower()
+        is_question = ("?" in text) or bool(re.match(r"\s*(who|what|when|where|why|how|do|does|did|can|could|would|is|are)\b", lower))
         extracted_risk = self._extract_risk_tolerance(text)
         extracted_name = self._extract_name(text)
         extracted_age = self._extract_age(text)
+        extracted_interest = self._extract_interest(text)
+        extracted_favorite = self._extract_favorite(text)
         if extracted_name:
             facts.append(self._build_fact_with_embedding(state=state, key="name", value=extracted_name, priority=1.0))
         if extracted_risk:
             facts.append(self._build_fact_with_embedding(state=state, key="risk_tolerance", value=extracted_risk, priority=0.95))
         if extracted_age is not None:
             facts.append(self._build_fact_with_embedding(state=state, key="age", value=str(extracted_age), priority=0.95))
-        if any(token in lower for token in ["my name is", "i am", "i'm"]):
+        if any(token in lower for token in ["my name is", "i am", "i'm"]) and not is_question:
             if len(facts) < self.max_facts_per_turn:
                 facts.append(self._build_fact_with_embedding(state=state, key="self_identifier", value=text, priority=0.7))
-        if any(token in lower for token in ["i prefer", "my preference is", "i like"]):
+        if extracted_interest and not is_question:
+            facts.append(self._build_fact_with_embedding(state=state, key="interest", value=extracted_interest, priority=0.85))
+        elif any(token in lower for token in ["i prefer", "my preference is", "i like", "i enjoy"]) and not is_question:
             facts.append(self._build_fact_with_embedding(state=state, key="preference", value=text, priority=0.8))
+        if extracted_favorite and not is_question:
+            facts.append(self._build_fact_with_embedding(state=state, key="favorite", value=extracted_favorite, priority=0.9))
         return facts[: self.max_facts_per_turn]
+
+    def _extract_interest(self, text: str) -> str | None:
+        normalized = re.sub(r"\s+", " ", text.strip())
+        patterns = [
+            r"\bi\s+(?:like|enjoy|prefer)\s+(.+?)(?=\s+and\s+my\s+fav(?:ou?rite)?\b|\s+but\b|[.!?]|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip(" .,!?:;\"'")
+                candidate = re.sub(r"\s+in\s+sports$", "", candidate, flags=re.IGNORECASE).strip(" .,!?:;\"'")
+                if candidate:
+                    return candidate
+        return None
+
+    def _extract_favorite(self, text: str) -> str | None:
+        normalized = re.sub(r"\s+", " ", text.strip())
+        patterns = [
+            r"\bmy\s+fav(?:ou?rite)?\s+anime\s+character\s+is\s+(.+?)(?:\s+from\s+\w+)?(?:[.!?]|$)",
+            r"\bmy\s+fav(?:ou?rite)?\s+(.+?)\s+is\s+(.+?)(?:[.!?]|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(match.lastindex or 1).strip(" .,!?:;\"'")
+            if candidate:
+                return candidate
+        return None
 
     def _build_fact_with_embedding(self, *, state: OrchestrationState, key: str, value: str, priority: float):
         fact = build_fact(
