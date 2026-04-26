@@ -40,6 +40,26 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS session_protected_facts (
+        fact_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        canonical_key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL,
+        supersedes_fact_id TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_session_protected_facts_lookup
+    ON session_protected_facts(user_id, session_id, status, canonical_key)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS user_facts (
         fact_id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,

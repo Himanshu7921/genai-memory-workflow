@@ -27,6 +27,15 @@ class MemoryRetrievalNode:
         state.memory_snapshot = snapshot.snapshot
         state.memory_budget_audit = snapshot.audit
         state.turn.retrieved_memory = {
+            "protected_facts": [
+                {
+                    "canonical_key": fact.canonical_key,
+                    "value": fact.value,
+                    "source": fact.source,
+                    "reason": fact.reason,
+                }
+                for fact in snapshot.snapshot.summary.protected_facts
+            ] if snapshot.snapshot.summary else [],
             "summary": snapshot.snapshot.summary.summary if snapshot.snapshot.summary else "",
             "pinned_facts": [
                 {

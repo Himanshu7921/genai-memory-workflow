@@ -12,14 +12,19 @@ class PromptBundle:
     user_prompt: str
 
 
-def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str | None = None) -> PromptBundle:
+def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str | None = None, include_memory_context: bool = True) -> PromptBundle:
     summary = ""
     if state.memory_snapshot and state.memory_snapshot.summary:
         summary = state.memory_snapshot.summary.summary.strip()[:500]
 
+    protected_lines: list[str] = []
     user_facts_lines: list[str] = []
     pinned_lines: list[str] = []
     if state.memory_snapshot:
+        protected_facts = state.memory_snapshot.summary.protected_facts if state.memory_snapshot.summary else []
+        for fact in protected_facts[:40]:
+            if fact.value.strip():
+                protected_lines.append(f"- {fact.canonical_key}: {fact.value.strip()[:140]}")
         for fact in state.memory_snapshot.user_facts[:8]:
             if fact.status == FactStatus.ACTIVE and fact.value.strip():
                 user_facts_lines.append(f"- {fact.canonical_key}: {fact.value.strip()[:140]}")
@@ -54,7 +59,8 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
         "5. Avoid over-personalization: use neutral phrasing like 'Based on your profile' instead of using user names or assumptions.\n"
         "6. If context is insufficient, state that clearly without asking follow-up questions.\n"
         "7. Do not output raw JSON, Python dicts, internal metadata, or debugging artifacts.\n"
-        "8. Keep responses short and actionable."
+        "8. Keep responses short and actionable.\n"
+        "9. Use memory context only when it directly answers the current query; otherwise ignore it."
     )
 
     memory_context = ""
@@ -64,10 +70,11 @@ def build_response_prompt_bundle(state: OrchestrationState, memory_answer: str |
     user_prompt = (
         "## User Query\n"
         f"{state.turn.message}\n\n"
-        "## Memory Context (L2 + L3)\n"
-        f"Session Summary (L2):\n{summary or 'none'}\n"
-        f"User Facts (L3):\n{chr(10).join(user_facts_lines) if user_facts_lines else '- none'}\n"
-        f"Pinned Facts:\n{chr(10).join(pinned_lines) if pinned_lines else '- none'}\n\n"
+        "## Memory Context (Protected Facts + L2 + L3)\n"
+        f"Protected Facts (L2):\n{chr(10).join(protected_lines) if include_memory_context and protected_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n"
+        f"Session Summary (L2):\n{summary if include_memory_context and summary else ('none' if include_memory_context else 'omitted due to irrelevance gate')}\n"
+        f"User Facts (L3):\n{chr(10).join(user_facts_lines) if include_memory_context and user_facts_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n"
+        f"Pinned Facts:\n{chr(10).join(pinned_lines) if include_memory_context and pinned_lines else ('- none' if include_memory_context else '- omitted due to irrelevance gate')}\n\n"
         "## Retrieved Documents\n"
         f"{chr(10).join(document_lines) if document_lines else '- none'}\n\n"
         "## Tool Results\n"

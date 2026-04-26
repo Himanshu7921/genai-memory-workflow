@@ -34,6 +34,14 @@ class BudgetAuditResponse(BaseModel):
     pinned_facts_used: int
     corpus_items_used: int
     evicted_items: list[str] = Field(default_factory=list)
+    model: str | None = None
+    budget_total: int | None = None
+    total_tokens: int | None = None
+    used_tokens: int | None = None
+    remaining_tokens: int | None = None
+    allocation: dict[str, Any] = Field(default_factory=dict)
+    evictions: list[str] = Field(default_factory=list)
+    eviction_events: list[str] = Field(default_factory=list)
 
 
 class TraceEventResponse(BaseModel):

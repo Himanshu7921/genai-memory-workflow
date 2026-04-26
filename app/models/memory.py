@@ -62,6 +62,22 @@ class PinnedFact:
 
 
 @dataclass(slots=True)
+class ProtectedFact:
+    fact_id: str
+    user_id: str
+    session_id: str
+    canonical_key: str
+    value: str
+    source: str
+    reason: str
+    supersedes_fact_id: str | None = None
+    status: FactStatus = FactStatus.ACTIVE
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class SessionTurn:
     turn_id: str
     user_id: str
@@ -78,6 +94,7 @@ class SessionSummary:
     user_id: str
     summary: str
     pinned_facts: list[PinnedFact] = field(default_factory=list)
+    protected_facts: list[ProtectedFact] = field(default_factory=list)
     turn_count: int = 0
     updated_at: datetime = field(default_factory=datetime.utcnow)
 

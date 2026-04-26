@@ -7,7 +7,7 @@ from app.core.config import DEFAULT_MEMORY_CONFIG, MemoryConfig
 from app.memory.corpus import CorpusMemoryService
 from app.memory.session import SessionMemoryService
 from app.memory.user import UserMemoryService, UserMemoryWriteResult
-from app.models.memory import CorpusChunkRecord, MemoryBudgetAudit, MemorySnapshot, PinnedFact, SessionTurn, WorkingMemoryTurn
+from app.models.memory import CorpusChunkRecord, MemoryBudgetAudit, MemorySnapshot, PinnedFact, ProtectedFact, SessionTurn, WorkingMemoryTurn
 from app.storage.memory_repo import MemoryRepository
 
 
@@ -102,6 +102,7 @@ class MemoryService:
         session_id: str,
         summary_text: str,
         pinned_facts: list[PinnedFact],
+        protected_facts: list[ProtectedFact] | None = None,
         turn_count_reset: bool = True,
     ) -> None:
         self.session.write_back_state(
@@ -109,6 +110,7 @@ class MemoryService:
             session_id=session_id,
             summary_text=summary_text,
             pinned_facts=pinned_facts,
+            protected_facts=protected_facts or [],
             turn_count_reset=turn_count_reset,
         )
 

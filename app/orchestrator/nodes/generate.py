@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 import logging
 import re
 from time import perf_counter
@@ -19,10 +20,73 @@ from app.llm.client import (
 from app.llm.prompts import build_response_prompt_bundle
 from app.models.memory import FactStatus
 from app.models.orchestration import GeneratedResponse, ModelSelection, OrchestrationState
+from app.orchestrator.context_builder import ContextBuilder
 from app.orchestrator.nodes.base import NodeResult
+from app.retrieval.embeddings import EmbeddingProvider, HashEmbeddingProvider, cosine_similarity
+from app.retrieval.embeddings_hf import HFEmbeddingProvider
 
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_memory_relevance_embedder() -> EmbeddingProvider:
+    try:
+        return HFEmbeddingProvider()
+    except Exception:
+        logger.warning("memory_relevance_embedding_provider_fallback", exc_info=True)
+        return HashEmbeddingProvider()
+
+
+
+def _chunk_memory_context(memory_context: str) -> list[str]:
+    chunks: list[str] = []
+    for raw_line in re.split(r"[\r\n]+", memory_context.strip()):
+        line = raw_line.strip().lstrip("- ").strip()
+        if not line:
+            continue
+        for piece in re.split(r"(?<=[.;!?])\s+", line):
+            candidate = piece.strip()
+            if len(candidate) >= 6:
+                chunks.append(candidate)
+    return chunks
+
+
+def memory_relevance_score(
+    query: str,
+    memory_context: str,
+    *,
+    threshold: float = 0.58,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> tuple[bool, float, str | None]:
+    normalized_query = query.strip()
+    if not normalized_query:
+        return False, 0.0, None
+
+    chunks = _chunk_memory_context(memory_context)
+    if not chunks:
+        return False, 0.0, None
+
+    embedder = embedding_provider or _get_memory_relevance_embedder()
+    query_embedding = embedder.embed_text(normalized_query)
+    if not query_embedding:
+        return False, 0.0, None
+
+    max_similarity = 0.0
+    best_chunk: str | None = None
+    chunk_embeddings = embedder.embed_texts(chunks)
+    for chunk, chunk_embedding in zip(chunks, chunk_embeddings):
+        similarity = cosine_similarity(query_embedding, chunk_embedding)
+        if similarity > max_similarity:
+            max_similarity = similarity
+            best_chunk = chunk
+
+    return max_similarity >= threshold, max_similarity, best_chunk
+
+
+def is_memory_relevant(query: str, memory_context: str, threshold: float = 0.58) -> bool:
+    relevant, _, _ = memory_relevance_score(query, memory_context, threshold=threshold)
+    return relevant
 
 
 @dataclass(slots=True)
@@ -33,10 +97,35 @@ class ResponseGenerationNode:
     llm_timeout_seconds: float = 4.0
     llm_invoke_retries: int = 1
     llm_fallback_models: tuple[str, ...] = ()
+    memory_relevance_threshold: float = 0.58
+    context_builder: ContextBuilder = field(default_factory=ContextBuilder)
 
     def run(self, state: OrchestrationState) -> NodeResult:
         sources: list[dict] = []
         used_llm = False
+        memory_context_text = self._build_memory_context_text(state)
+        memory_relevant, memory_similarity, matched_chunk = memory_relevance_score(
+            state.turn.message,
+            memory_context_text,
+            threshold=self.memory_relevance_threshold,
+        )
+        if state.intent and state.intent.intent == "memory_write":
+            memory_relevant = False
+
+        state.metadata["response_memory_relevant"] = memory_relevant
+        state.metadata["response_memory_max_similarity"] = round(memory_similarity, 4)
+        state.metadata["response_memory_similarity_threshold"] = self.memory_relevance_threshold
+        state.metadata["response_memory_matched_chunk"] = matched_chunk or ""
+        state.metadata["response_memory_context_chars"] = len(memory_context_text)
+        logger.info(
+            "memory_relevance_decision",
+            extra={
+                "query": state.turn.message,
+                "max_similarity": round(memory_similarity, 4),
+                "threshold": self.memory_relevance_threshold,
+                "memory_used": memory_relevant,
+            },
+        )
 
         # Collect all context sources for LLM
         if state.tool_results:
@@ -57,11 +146,14 @@ class ResponseGenerationNode:
                     }
                 )
 
-        if state.memory_snapshot and state.memory_snapshot.summary and state.memory_snapshot.summary.summary:
+        if memory_relevant and state.memory_snapshot and state.memory_snapshot.summary and state.memory_snapshot.summary.summary:
             sources.append({"type": "session_memory", "session_id": state.turn.session_id})
 
         # Check for memory-answerable questions and add to context
-        memory_answer, memory_source = self._answer_from_memory(state)
+        memory_answer: str | None = None
+        memory_source: str | None = None
+        if memory_relevant:
+            memory_answer, memory_source = self._answer_from_memory(state)
         if memory_answer is not None:
             source_type = memory_source or "session_memory"
             if not any(item.get("type") == source_type for item in sources):
@@ -69,8 +161,27 @@ class ResponseGenerationNode:
             state.metadata["response_memory_match"] = memory_answer
             state.metadata["response_memory_source"] = memory_source
 
+        system_instruction_preview = build_response_prompt_bundle(
+            state,
+            memory_answer=None,
+            include_memory_context=memory_relevant,
+        ).system_instruction
+        model_tier = "primary"
+        if "fallback" in self.llm_model.lower() or "8" in self.llm_model.lower():
+            model_tier = "fallback"
+        context_result = self.context_builder.build(
+            state=state,
+            system_prompt=system_instruction_preview,
+            include_memory_context=memory_relevant,
+            model_tier=model_tier,
+        )
+        scoped_state = context_result.scoped_state
+        state.metadata["context_budget_audit"] = context_result.audit
+        state.metadata["context_eviction_events"] = list(context_result.audit.get("eviction_events", []))
+        state.metadata["context_budget_model_tier"] = model_tier
+
         # ALWAYS route through LLM. Fallback is only allowed when LLM call fails.
-        llm_answer = self._generate_with_llm(state, memory_answer=memory_answer)
+        llm_answer = self._generate_with_llm(scoped_state, memory_answer=memory_answer, include_memory_context=memory_relevant)
         
         if llm_answer:
             final_answer = llm_answer
@@ -103,8 +214,8 @@ class ResponseGenerationNode:
         )
         return NodeResult(state=state)
 
-    def _generate_with_llm(self, state: OrchestrationState, memory_answer: str | None = None) -> str | None:
-        prompt = build_response_prompt_bundle(state, memory_answer=memory_answer)
+    def _generate_with_llm(self, state: OrchestrationState, memory_answer: str | None = None, include_memory_context: bool = True) -> str | None:
+        prompt = build_response_prompt_bundle(state, memory_answer=memory_answer, include_memory_context=include_memory_context)
         logger.info(
             "LLM_CALL_STARTED",
             extra={
@@ -248,6 +359,25 @@ class ResponseGenerationNode:
             state.metadata["response_llm_attempts"] = len(attempt_errors)
 
         return None
+
+    def _build_memory_context_text(self, state: OrchestrationState) -> str:
+        if state.memory_snapshot is None:
+            return ""
+
+        parts: list[str] = []
+        if state.memory_snapshot.summary and state.memory_snapshot.summary.summary.strip():
+            parts.append(state.memory_snapshot.summary.summary.strip())
+        if state.memory_snapshot.summary:
+            for fact in state.memory_snapshot.summary.protected_facts:
+                if fact.value.strip():
+                    parts.append(f"{fact.canonical_key} {fact.value.strip()}")
+        for fact in state.memory_snapshot.user_facts:
+            if fact.status == FactStatus.ACTIVE and fact.value.strip():
+                parts.append(f"{fact.canonical_key} {fact.value.strip()}")
+        for fact in state.memory_snapshot.pinned_facts:
+            if fact.value.strip():
+                parts.append(f"{fact.canonical_key} {fact.value.strip()}")
+        return "\n".join(parts)
 
     def _heuristic_response_fallback(self, state: OrchestrationState, memory_answer: str | None = None) -> str:
         # If we have a direct memory answer and LLM failed, return it

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from app.models.memory import CorpusChunkRecord, FactScope, FactStatus, MemoryFact, PinnedFact, SessionSummary, SessionTurn
+from app.models.memory import CorpusChunkRecord, FactScope, FactStatus, MemoryFact, PinnedFact, ProtectedFact, SessionSummary, SessionTurn
 from app.storage.sqlite import SQLiteStore
 
 
@@ -43,11 +43,13 @@ class MemoryRepository:
         if not row:
             return None
         pinned = self.list_session_pinned_facts(user_id=user_id, session_id=session_id)
+        protected = self.list_session_protected_facts(user_id=user_id, session_id=session_id)
         return SessionSummary(
             session_id=session_id,
             user_id=user_id,
             summary=row["summary"],
             pinned_facts=pinned,
+            protected_facts=protected,
             turn_count=row["turn_count"],
             updated_at=_parse_dt(row["updated_at"]) or datetime.utcnow(),
         )
@@ -199,7 +201,19 @@ class MemoryRepository:
             for row in rows
         ]
 
-    def upsert_session_summary(self, *, user_id: str, session_id: str, summary: str, pinned_facts: list[PinnedFact], updated_at: datetime) -> None:
+    def list_session_protected_facts(self, *, user_id: str, session_id: str) -> list[ProtectedFact]:
+        with self.store.read_only() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM session_protected_facts
+                WHERE user_id = ? AND session_id = ? AND status = ?
+                ORDER BY updated_at DESC
+                """,
+                (user_id, session_id, FactStatus.ACTIVE.value),
+            ).fetchall()
+        return [self._row_to_protected_fact(row) for row in rows]
+
+    def upsert_session_summary(self, *, user_id: str, session_id: str, summary: str, pinned_facts: list[PinnedFact], protected_facts: list[ProtectedFact] | None = None, updated_at: datetime) -> None:
         with self.store.transaction() as connection:
             connection.execute(
                 """
@@ -244,6 +258,94 @@ class MemoryRepository:
                         pinned_fact.updated_at.isoformat(),
                     ),
                 )
+            self._upsert_session_protected_facts(
+                connection,
+                user_id=user_id,
+                session_id=session_id,
+                protected_facts=protected_facts or [],
+                updated_at=updated_at,
+            )
+
+    def _upsert_session_protected_facts(self, connection: Any, *, user_id: str, session_id: str, protected_facts: list[ProtectedFact], updated_at: datetime) -> None:
+        if not protected_facts:
+            return
+
+        existing_rows = connection.execute(
+            """
+            SELECT * FROM session_protected_facts
+            WHERE user_id = ? AND session_id = ? AND status = ?
+            ORDER BY updated_at DESC
+            """,
+            (user_id, session_id, FactStatus.ACTIVE.value),
+        ).fetchall()
+        active_by_key = {row["canonical_key"]: row for row in existing_rows}
+
+        for protected_fact in protected_facts:
+            prior_row = active_by_key.get(protected_fact.canonical_key)
+            if prior_row is not None and prior_row["value"].strip() != protected_fact.value.strip():
+                connection.execute(
+                    """
+                    UPDATE session_protected_facts
+                    SET status = ?,
+                        updated_at = ?
+                    WHERE fact_id = ?
+                    """,
+                    (FactStatus.SUPERSEDED.value, updated_at.isoformat(), prior_row["fact_id"]),
+                )
+            elif prior_row is not None:
+                connection.execute(
+                    """
+                    UPDATE session_protected_facts
+                    SET source = ?,
+                        reason = ?,
+                        metadata_json = ?,
+                        updated_at = ?
+                    WHERE fact_id = ?
+                    """,
+                    (
+                        protected_fact.source,
+                        protected_fact.reason,
+                        _dump_json(protected_fact.metadata),
+                        updated_at.isoformat(),
+                        prior_row["fact_id"],
+                    ),
+                )
+                active_by_key[protected_fact.canonical_key] = prior_row
+                continue
+
+            connection.execute(
+                """
+                INSERT INTO session_protected_facts(fact_id, user_id, session_id, canonical_key, value, source, reason, status, supersedes_fact_id, metadata_json, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fact_id) DO UPDATE SET
+                    canonical_key = excluded.canonical_key,
+                    value = excluded.value,
+                    source = excluded.source,
+                    reason = excluded.reason,
+                    status = excluded.status,
+                    supersedes_fact_id = excluded.supersedes_fact_id,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    protected_fact.fact_id,
+                    protected_fact.user_id,
+                    protected_fact.session_id,
+                    protected_fact.canonical_key,
+                    protected_fact.value,
+                    protected_fact.source,
+                    protected_fact.reason,
+                    protected_fact.status.value,
+                    protected_fact.supersedes_fact_id,
+                    _dump_json(protected_fact.metadata),
+                    protected_fact.created_at.isoformat(),
+                    protected_fact.updated_at.isoformat(),
+                ),
+            )
+            active_by_key[protected_fact.canonical_key] = {
+                "fact_id": protected_fact.fact_id,
+                "value": protected_fact.value,
+            }
 
     def list_user_facts(self, *, user_id: str) -> list[MemoryFact]:
         with self.store.read_only() as connection:
@@ -328,6 +430,22 @@ class MemoryRepository:
             updated_at=_parse_dt(row["updated_at"]) or datetime.utcnow(),
             last_accessed_at=_parse_dt(row["last_accessed_at"]) or datetime.utcnow(),
             expires_at=_parse_dt(row["expires_at"]),
+        )
+
+    def _row_to_protected_fact(self, row: Any) -> ProtectedFact:
+        return ProtectedFact(
+            fact_id=row["fact_id"],
+            user_id=row["user_id"],
+            session_id=row["session_id"],
+            canonical_key=row["canonical_key"],
+            value=row["value"],
+            source=row["source"],
+            reason=row["reason"],
+            supersedes_fact_id=row["supersedes_fact_id"],
+            status=FactStatus(row["status"]),
+            created_at=_parse_dt(row["created_at"]) or datetime.utcnow(),
+            updated_at=_parse_dt(row["updated_at"]) or datetime.utcnow(),
+            metadata=_load_json(row["metadata_json"]),
         )
 
     def upsert_document(self, *, document_id: str, user_id: str | None, source_uri: str | None, title: str | None, content_hash: str, metadata: dict[str, Any]) -> None:

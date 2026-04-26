@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Iterable
 
 from app.core.config import DEFAULT_MEMORY_CONFIG, MemoryConfig
-from app.models.memory import MemorySnapshot, PinnedFact, SessionSummary, SessionTurn
+from app.models.memory import MemorySnapshot, PinnedFact, ProtectedFact, SessionSummary, SessionTurn
 from app.storage.memory_repo import MemoryRepository
 
 
@@ -48,12 +48,21 @@ class SessionMemoryService:
         self.repository.append_turn(turn)
         self.repository.bump_session_turn_count(user_id=turn.user_id, session_id=turn.session_id)
 
-    def update_summary(self, *, user_id: str, session_id: str, summary_text: str, pinned_facts: Iterable[PinnedFact]) -> None:
+    def update_summary(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        summary_text: str,
+        pinned_facts: Iterable[PinnedFact],
+        protected_facts: Iterable[ProtectedFact] = (),
+    ) -> None:
         self.repository.upsert_session_summary(
             user_id=user_id,
             session_id=session_id,
             summary=summary_text,
             pinned_facts=list(pinned_facts),
+            protected_facts=list(protected_facts),
             updated_at=datetime.utcnow(),
         )
 
@@ -64,9 +73,17 @@ class SessionMemoryService:
         session_id: str,
         summary_text: str,
         pinned_facts: Iterable[PinnedFact],
+        protected_facts: Iterable[ProtectedFact] = (),
         turn_count_reset: bool = True,
     ) -> None:
-        self.update_summary(user_id=user_id, session_id=session_id, summary_text=summary_text, pinned_facts=pinned_facts)
+        self.repository.upsert_session_summary(
+            user_id=user_id,
+            session_id=session_id,
+            summary=summary_text,
+            pinned_facts=list(pinned_facts),
+            protected_facts=list(protected_facts),
+            updated_at=datetime.utcnow(),
+        )
         if turn_count_reset:
             self.repository.reset_session_write_counters(user_id=user_id, session_id=session_id)
 

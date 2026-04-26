@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from hashlib import sha256
 import re
 
 from app.memory.service import MemoryService
 from app.memory.resolver import build_fact
-from app.models.memory import FactScope, PinnedFact
+from app.memory.protected_facts import build_protected_fact, extract_protected_fact_candidates, merge_protected_facts
+from app.models.memory import FactScope, PinnedFact, ProtectedFact
 from app.models.orchestration import OrchestrationState
 from app.orchestrator.nodes.base import NodeResult
 
@@ -26,6 +26,13 @@ class MemoryWriteBackNode:
         pinned_facts = self._merge_pinned_facts(
             existing=list(state.memory_snapshot.pinned_facts),
             incoming=newly_pinned,
+        )
+        newly_protected = self._extract_protected_facts(state)
+        existing_protected = list(state.memory_snapshot.summary.protected_facts) if state.memory_snapshot.summary else []
+        protected_facts = merge_protected_facts(
+            existing_protected,
+            newly_protected,
+            max_items=self.memory_service.config.session_protected_facts_max,
         )
 
         facts_to_write = self._extract_user_facts(state)
@@ -55,23 +62,18 @@ class MemoryWriteBackNode:
             )
             write_summary = plan.write_session_summary or budget_triggered
             summary_text = state.memory_snapshot.summary.summary if state.memory_snapshot.summary else ""
-            if write_summary:
-                summary_source = state.response.final_answer if state.response else state.turn.message
-                summary_text = self._build_summary(state, summary_source)
+            should_write_memory = write_summary or newly_pinned or newly_protected
+            if should_write_memory:
+                if write_summary:
+                    summary_source = state.response.final_answer if state.response else state.turn.message
+                    summary_text = self._build_summary(state, summary_source)
                 self.memory_service.write_session_memory(
                     user_id=state.turn.user_id,
                     session_id=state.turn.session_id,
                     summary_text=summary_text,
                     pinned_facts=pinned_facts,
-                )
-            elif newly_pinned:
-                # Keep pinned facts durable even when summary write is throttled.
-                self.memory_service.write_session_memory(
-                    user_id=state.turn.user_id,
-                    session_id=state.turn.session_id,
-                    summary_text=summary_text,
-                    pinned_facts=pinned_facts,
-                    turn_count_reset=False,
+                    protected_facts=protected_facts,
+                    turn_count_reset=write_summary,
                 )
 
             refreshed = self.memory_service.load(
@@ -85,10 +87,13 @@ class MemoryWriteBackNode:
             state.metadata["summary_write_reason"] = "budget_trigger" if budget_triggered and not plan.write_session_summary else plan.reason
             state.metadata["summary_context_chars"] = context_chars
             state.metadata["summary_write_triggered"] = write_summary
+            state.metadata["protected_facts_extracted"] = [fact.value for fact in newly_protected]
+            state.metadata["protected_facts_count"] = len(protected_facts)
 
         state.metadata["write_back_snapshot_at"] = datetime.utcnow().isoformat()
         state.metadata["write_back_summary"] = state.memory_snapshot.summary.summary if state.memory_snapshot and state.memory_snapshot.summary else ""
         state.metadata["write_back_pinned_count"] = len(pinned_facts)
+        state.metadata["write_back_protected_count"] = len(state.memory_snapshot.summary.protected_facts) if state.memory_snapshot and state.memory_snapshot.summary else 0
         state.metadata["write_back_facts"] = [fact.fact_id for fact in facts_to_write]
         return NodeResult(state=state)
 
@@ -220,7 +225,29 @@ class MemoryWriteBackNode:
         summary_chars = len(state.memory_snapshot.summary.summary) if state.memory_snapshot and state.memory_snapshot.summary else 0
         turn_chars = sum(len(turn.content) for turn in state.memory_snapshot.session_turns) if state.memory_snapshot else 0
         pinned_chars = sum(len(fact.value) for fact in state.memory_snapshot.pinned_facts) if state.memory_snapshot else 0
-        return summary_chars + turn_chars + pinned_chars + len(state.turn.message)
+        protected_chars = sum(len(fact.value) for fact in state.memory_snapshot.summary.protected_facts) if state.memory_snapshot and state.memory_snapshot.summary else 0
+        return summary_chars + turn_chars + pinned_chars + protected_chars + len(state.turn.message)
+
+    def _extract_protected_facts(self, state: OrchestrationState) -> list[ProtectedFact]:
+        now = datetime.utcnow()
+        extracted: list[ProtectedFact] = []
+        seen: set[str] = set()
+
+        source_texts: list[tuple[str, str]] = [("conversation", state.turn.message)]
+        if state.retrieval_context and state.retrieval_context.chunks:
+            for chunk in state.retrieval_context.chunks:
+                source_texts.append(("retrieval", chunk.content))
+
+        for source, text in source_texts:
+            for candidate in extract_protected_fact_candidates(text, source=source):
+                fact = build_protected_fact(user_id=state.turn.user_id, session_id=state.turn.session_id, candidate=candidate, now=now)
+                marker = f"{fact.canonical_key}:{fact.value.lower()}"
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                extracted.append(fact)
+
+        return extracted
 
     def _extract_pinned_facts(self, state: OrchestrationState) -> list[PinnedFact]:
         text = state.turn.message.strip()
@@ -256,6 +283,8 @@ class MemoryWriteBackNode:
         return pinned
 
     def _build_pinned_fact(self, state: OrchestrationState, canonical_key: str, value: str, reason: str, now: datetime) -> PinnedFact:
+        from hashlib import sha256
+
         digest = sha256(f"{state.turn.user_id}:{state.turn.session_id}:{canonical_key}:{value.lower()}".encode("utf-8")).hexdigest()[:24]
         return PinnedFact(
             fact_id=f"pinned_{digest}",
@@ -270,10 +299,7 @@ class MemoryWriteBackNode:
         )
 
     def _merge_pinned_facts(self, *, existing: list[PinnedFact], incoming: list[PinnedFact]) -> list[PinnedFact]:
-        merged: dict[str, PinnedFact] = {
-            f"{fact.canonical_key}:{fact.value}": fact
-            for fact in existing
-        }
+        merged: dict[str, PinnedFact] = {f"{fact.canonical_key}:{fact.value}": fact for fact in existing}
         for fact in incoming:
             merged[f"{fact.canonical_key}:{fact.value}"] = fact
         return list(merged.values())

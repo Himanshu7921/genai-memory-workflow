@@ -9,6 +9,7 @@ class MemoryConfig:
     session_summary_trigger_turns: int = 4
     session_context_char_budget: int = 2400
     session_summary_max_chars: int = 1600
+    session_protected_facts_max: int = 40
     session_write_throttle_seconds: int = 30
     user_write_throttle_seconds: int = 60
     fact_decay_days: int = 30

@@ -37,19 +37,48 @@ function normalizeResponse(data: Record<string, unknown>): ChatResponseMeta {
       ? (data.budget_audit as Record<string, unknown>)
       : undefined;
 
-  const allocation = budgetAudit
-    ? {
-        session_recent_turns_used: Number(budgetAudit.session_recent_turns_used ?? 0),
-        session_summary_chars: Number(budgetAudit.session_summary_chars ?? 0),
-        user_facts_used: Number(budgetAudit.user_facts_used ?? 0),
-        pinned_facts_used: Number(budgetAudit.pinned_facts_used ?? 0),
-        corpus_items_used: Number(budgetAudit.corpus_items_used ?? 0),
-      }
-    : undefined;
+  const allocation = (() => {
+    if (!budgetAudit) {
+      return undefined;
+    }
 
-  const evictions = Array.isArray(budgetAudit?.evicted_items)
-    ? (budgetAudit?.evicted_items as string[])
-    : undefined;
+    const rawAllocation = budgetAudit.allocation;
+    if (rawAllocation && typeof rawAllocation === "object") {
+      const normalized: Record<string, number> = {};
+      for (const [key, value] of Object.entries(rawAllocation as Record<string, unknown>)) {
+        if (typeof value === "number") {
+          normalized[key] = value;
+          continue;
+        }
+        if (value && typeof value === "object") {
+          const tokens = (value as Record<string, unknown>).tokens;
+          if (typeof tokens === "number") {
+            normalized[key] = tokens;
+          }
+        }
+      }
+      if (Object.keys(normalized).length > 0) {
+        return normalized;
+      }
+    }
+
+    return {
+      session_recent_turns_used: Number(budgetAudit.session_recent_turns_used ?? 0),
+      session_summary_chars: Number(budgetAudit.session_summary_chars ?? 0),
+      user_facts_used: Number(budgetAudit.user_facts_used ?? 0),
+      pinned_facts_used: Number(budgetAudit.pinned_facts_used ?? 0),
+      corpus_items_used: Number(budgetAudit.corpus_items_used ?? 0),
+    };
+  })();
+
+  const evictions =
+    Array.isArray(budgetAudit?.evictions)
+      ? (budgetAudit?.evictions as string[])
+      : Array.isArray(budgetAudit?.eviction_events)
+        ? (budgetAudit?.eviction_events as string[])
+        : Array.isArray(budgetAudit?.evicted_items)
+          ? (budgetAudit?.evicted_items as string[])
+          : undefined;
 
   const final_answer: string =
     (typeof data.final_answer === "string" && data.final_answer) ||
