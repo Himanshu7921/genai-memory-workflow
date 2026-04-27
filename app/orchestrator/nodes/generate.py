@@ -327,9 +327,10 @@ class ResponseGenerationNode:
                 continue
 
             if state.intent is not None and state.intent.intent != "grounded_qa":
-                answer = re.sub(r"^No relevant information found\.?\s*", "", answer, flags=re.IGNORECASE).strip()
-                if not answer:
-                    continue
+                # Preserve non-empty model text as-is; dropping it can force an unnecessary local fallback.
+                normalized = re.sub(r"^No relevant information found\.?\s*", "", answer, flags=re.IGNORECASE).strip()
+                if normalized:
+                    answer = normalized
 
             mark_llm_success()
             logger.info(
