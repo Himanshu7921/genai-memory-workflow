@@ -9,6 +9,7 @@ from time import perf_counter
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.llm.client import (
+    GEMINI_DEFAULT_MODEL_NAME,
     LLMClientConfig,
     build_model_candidates,
     classify_llm_error,
@@ -93,7 +94,7 @@ def is_memory_relevant(query: str, memory_context: str, threshold: float = 0.58)
 class ResponseGenerationNode:
     name: str = "response_generation"
     llm_temperature: float = 0.2
-    llm_model: str = "gemini-flash-lite-latest"
+    llm_model: str = GEMINI_DEFAULT_MODEL_NAME
     llm_timeout_seconds: float = 4.0
     llm_invoke_retries: int = 1
     llm_fallback_models: tuple[str, ...] = ()

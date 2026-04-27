@@ -11,18 +11,16 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 logger = logging.getLogger(__name__)
 GEMINI_MIN_TIMEOUT_SECONDS = 10.0
+GEMINI_DEFAULT_MODEL_NAME = "gemini-2.5-flash"
 
 
 @dataclass(frozen=True, slots=True)
 class LLMClientConfig:
-    model_name: str = "gemini-2.5-flash"
+    model_name: str = GEMINI_DEFAULT_MODEL_NAME
     temperature: float = 0.2
     timeout_seconds: float = 20.0
     fallback_models: tuple[str, ...] = (
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-flash",
+        GEMINI_DEFAULT_MODEL_NAME,
     )
 
 
